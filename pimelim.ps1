@@ -1,0 +1,542 @@
+#!/usr/bin/env pwsh
+
+[CmdletBinding()]
+param(
+    [string]$EnvFile = ".env",
+    [switch]$Bootstrap,
+    [switch]$DryRun,
+    [int]$FutureWindows,
+    [int]$DurationHours,
+    [string]$Timezone
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [ValidateSet("INFO", "WARN", "ERROR")][string]$Level = "INFO"
+    )
+
+    $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    $line = "[$timestamp][$Level] $Message"
+    Write-Host $line
+
+    if ($script:LogFilePath) {
+        Add-Content -Path $script:LogFilePath -Value $line
+    }
+}
+
+function Resolve-PathSafe {
+    param(
+        [Parameter(Mandatory = $true)][string]$BaseDirectory,
+        [Parameter(Mandatory = $true)][string]$PathValue
+    )
+
+    if ([System.IO.Path]::IsPathRooted($PathValue)) {
+        return [System.IO.Path]::GetFullPath($PathValue)
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path $BaseDirectory $PathValue))
+}
+
+function Read-EnvFile {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $envMap = @{}
+    if (-not (Test-Path -Path $Path)) {
+        return $envMap
+    }
+
+    foreach ($rawLine in Get-Content -Path $Path) {
+        $line = $rawLine.Trim()
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith("#")) {
+            continue
+        }
+
+        $parts = $line.Split("=", 2)
+        if ($parts.Count -ne 2) {
+            continue
+        }
+
+        $key = $parts[0].Trim()
+        $value = $parts[1].Trim()
+
+        if (($value.StartsWith("\"") -and $value.EndsWith("\"")) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+
+        $envMap[$key] = $value
+    }
+
+    return $envMap
+}
+
+function Get-ConfigValue {
+    param(
+        [hashtable]$EnvMap,
+        [string]$Key,
+        [string]$Default = ""
+    )
+
+    if ($EnvMap.ContainsKey($Key) -and -not [string]::IsNullOrWhiteSpace($EnvMap[$Key])) {
+        return $EnvMap[$Key]
+    }
+
+    return $Default
+}
+
+function Get-RoleConfigs {
+    param([hashtable]$EnvMap)
+
+    $roles = @()
+    $index = 1
+
+    while ($true) {
+        $nameKey = "PIM_ROLE_${index}_NAME"
+        $reasonKey = "PIM_ROLE_${index}_REASON"
+
+        if (-not $EnvMap.ContainsKey($nameKey) -or [string]::IsNullOrWhiteSpace($EnvMap[$nameKey])) {
+            break
+        }
+
+        $roles += [PSCustomObject]@{
+            Name = $EnvMap[$nameKey].Trim()
+            Reason = (Get-ConfigValue -EnvMap $EnvMap -Key $reasonKey -Default "Scheduled activation by PIMELIM")
+        }
+        $index++
+    }
+
+    return $roles
+}
+
+function Invoke-GraphRequest {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet("GET", "POST")][string]$Method,
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][string]$AccessToken,
+        [object]$Body = $null
+    )
+
+    $headers = @{ Authorization = "Bearer $AccessToken" }
+    $attempt = 0
+    $maxAttempts = 4
+
+    while ($true) {
+        try {
+            if ($null -ne $Body) {
+                $json = $Body | ConvertTo-Json -Depth 10
+                return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -Body $json -ContentType "application/json"
+            }
+
+            return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers
+        }
+        catch {
+            $attempt++
+            $statusCode = $null
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+            }
+
+            if ($attempt -lt $maxAttempts -and (($statusCode -eq 429) -or ($statusCode -ge 500 -and $statusCode -lt 600))) {
+                $sleepSeconds = [math]::Min(30, [math]::Pow(2, $attempt))
+                Write-Log -Level "WARN" -Message "Graph call failed with status $statusCode. Retrying in $sleepSeconds second(s)."
+                Start-Sleep -Seconds $sleepSeconds
+                continue
+            }
+
+            throw
+        }
+    }
+}
+
+function Save-TokenCache {
+    param(
+        [string]$Path,
+        [object]$TokenResponse
+    )
+
+    if (-not $TokenResponse.refresh_token) {
+        return
+    }
+
+    $cache = [PSCustomObject]@{
+        access_token = $TokenResponse.access_token
+        refresh_token = $TokenResponse.refresh_token
+        expires_at_utc = (Get-Date).ToUniversalTime().AddSeconds([int]$TokenResponse.expires_in).ToString("o")
+    }
+
+    $cache | ConvertTo-Json | Set-Content -Path $Path
+}
+
+function Request-DeviceCodeToken {
+    param(
+        [Parameter(Mandatory = $true)][string]$TenantId,
+        [Parameter(Mandatory = $true)][string]$ClientId,
+        [Parameter(Mandatory = $true)][string]$TokenCachePath
+    )
+
+    $scope = "https://graph.microsoft.com/.default offline_access openid profile"
+    $deviceCodeUri = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/devicecode"
+    $tokenUri = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+
+    $deviceResponse = Invoke-RestMethod -Method POST -Uri $deviceCodeUri -ContentType "application/x-www-form-urlencoded" -Body @{
+        client_id = $ClientId
+        scope = $scope
+    }
+
+    Write-Log -Message $deviceResponse.message
+
+    $pollInterval = [int]$deviceResponse.interval
+    $expiresAt = (Get-Date).AddSeconds([int]$deviceResponse.expires_in)
+
+    while ((Get-Date) -lt $expiresAt) {
+        Start-Sleep -Seconds $pollInterval
+
+        try {
+            $tokenResponse = Invoke-RestMethod -Method POST -Uri $tokenUri -ContentType "application/x-www-form-urlencoded" -Body @{
+                grant_type = "urn:ietf:params:oauth:grant-type:device_code"
+                client_id = $ClientId
+                device_code = $deviceResponse.device_code
+            }
+
+            Save-TokenCache -Path $TokenCachePath -TokenResponse $tokenResponse
+            return $tokenResponse
+        }
+        catch {
+            $detail = $_.ErrorDetails.Message
+            if ($detail -and $detail -match "authorization_pending|slow_down") {
+                continue
+            }
+
+            throw
+        }
+    }
+
+    throw "Device-code login timed out."
+}
+
+function Request-RefreshToken {
+    param(
+        [Parameter(Mandatory = $true)][string]$TenantId,
+        [Parameter(Mandatory = $true)][string]$ClientId,
+        [Parameter(Mandatory = $true)][string]$RefreshToken,
+        [Parameter(Mandatory = $true)][string]$TokenCachePath
+    )
+
+    $tokenUri = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+
+    $tokenResponse = Invoke-RestMethod -Method POST -Uri $tokenUri -ContentType "application/x-www-form-urlencoded" -Body @{
+        grant_type = "refresh_token"
+        client_id = $ClientId
+        refresh_token = $RefreshToken
+        scope = "https://graph.microsoft.com/.default offline_access openid profile"
+    }
+
+    Save-TokenCache -Path $TokenCachePath -TokenResponse $tokenResponse
+    return $tokenResponse
+}
+
+function Get-AccessToken {
+    param(
+        [string]$TenantId,
+        [string]$ClientId,
+        [string]$TokenCachePath,
+        [switch]$AllowInteractive
+    )
+
+    if (Test-Path -Path $TokenCachePath) {
+        $cache = Get-Content -Path $TokenCachePath -Raw | ConvertFrom-Json
+        $expiresAt = [DateTime]::Parse($cache.expires_at_utc).ToUniversalTime()
+
+        if ($cache.access_token -and $expiresAt -gt (Get-Date).ToUniversalTime().AddMinutes(5)) {
+            return $cache.access_token
+        }
+
+        if ($cache.refresh_token) {
+            try {
+                $tokenResponse = Request-RefreshToken -TenantId $TenantId -ClientId $ClientId -RefreshToken $cache.refresh_token -TokenCachePath $TokenCachePath
+                Write-Log -Message "Refreshed Graph token from local cache."
+                return $tokenResponse.access_token
+            }
+            catch {
+                Write-Log -Level "WARN" -Message "Refresh token flow failed: $($_.Exception.Message)"
+            }
+        }
+    }
+
+    if (-not $AllowInteractive) {
+        throw "No valid token cache available. Run once with -Bootstrap to complete device login."
+    }
+
+    Write-Log -Message "Starting interactive bootstrap login."
+    $bootstrapToken = Request-DeviceCodeToken -TenantId $TenantId -ClientId $ClientId -TokenCachePath $TokenCachePath
+    return $bootstrapToken.access_token
+}
+
+function Get-TimezoneAdapter {
+    param([string]$TimezoneValue)
+
+    if ([string]::IsNullOrWhiteSpace($TimezoneValue)) {
+        $TimezoneValue = "UTC"
+    }
+
+    if ($TimezoneValue -match '^UTC([+\-])(\d{1,2})(?::?(\d{2}))?$') {
+        $sign = if ($matches[1] -eq "-") { -1 } else { 1 }
+        $hours = [int]$matches[2]
+        $minutes = if ($matches[3]) { [int]$matches[3] } else { 0 }
+        $offset = New-TimeSpan -Hours ($sign * $hours) -Minutes ($sign * $minutes)
+
+        return [PSCustomObject]@{
+            Kind = "Offset"
+            Offset = $offset
+            Name = $TimezoneValue
+        }
+    }
+
+    try {
+        return [PSCustomObject]@{
+            Kind = "TimeZoneInfo"
+            Value = [System.TimeZoneInfo]::FindSystemTimeZoneById($TimezoneValue)
+            Name = $TimezoneValue
+        }
+    }
+    catch {
+        throw "Unsupported timezone '$TimezoneValue'. Use UTC, UTC+1, UTC-05:00, or a valid system timezone ID."
+    }
+}
+
+function Convert-UtcToLocal {
+    param($Adapter, [datetime]$UtcDateTime)
+
+    if ($Adapter.Kind -eq "Offset") {
+        return [datetimeoffset]::new($UtcDateTime, [timespan]::Zero).ToOffset($Adapter.Offset).DateTime
+    }
+
+    return [System.TimeZoneInfo]::ConvertTimeFromUtc($UtcDateTime, $Adapter.Value)
+}
+
+function Convert-LocalToUtc {
+    param($Adapter, [datetime]$LocalDateTime)
+
+    if ($Adapter.Kind -eq "Offset") {
+        $dto = [datetimeoffset]::new($LocalDateTime, $Adapter.Offset)
+        return $dto.UtcDateTime
+    }
+
+    return [System.TimeZoneInfo]::ConvertTimeToUtc($LocalDateTime, $Adapter.Value)
+}
+
+function Get-DesiredStartTimesUtc {
+    param(
+        [datetime]$NowUtc,
+        [int]$DurationHours,
+        [int]$FutureWindows,
+        $TimezoneAdapter
+    )
+
+    $nowLocal = Convert-UtcToLocal -Adapter $TimezoneAdapter -UtcDateTime $NowUtc
+    $localMidnight = $nowLocal.Date
+    $hoursSinceMidnight = ($nowLocal - $localMidnight).TotalHours
+    $currentSlot = [math]::Floor($hoursSinceMidnight / $DurationHours)
+    $firstLocalStart = $localMidnight.AddHours(($currentSlot + 1) * $DurationHours)
+
+    $starts = @()
+    for ($i = 0; $i -lt $FutureWindows; $i++) {
+        $localStart = $firstLocalStart.AddHours($i * $DurationHours)
+        $starts += Convert-LocalToUtc -Adapter $TimezoneAdapter -LocalDateTime $localStart
+    }
+
+    return $starts
+}
+
+function Format-GraphDateTime {
+    param([datetime]$DateValue)
+    return $DateValue.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+}
+
+function Get-RoleDefinitionByName {
+    param(
+        [string]$RoleName,
+        [string]$AccessToken
+    )
+
+    $encodedRoleName = [System.Web.HttpUtility]::UrlEncode("displayName eq '$RoleName'")
+    $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions?`$filter=$encodedRoleName"
+    $response = Invoke-GraphRequest -Method GET -Uri $uri -AccessToken $AccessToken
+
+    if (-not $response.value -or $response.value.Count -eq 0) {
+        throw "Role '$RoleName' not found in tenant role definitions."
+    }
+
+    if ($response.value.Count -gt 1) {
+        Write-Log -Level "WARN" -Message "Multiple role definitions matched '$RoleName'. Using first match."
+    }
+
+    return $response.value[0]
+}
+
+function Get-ExistingScheduledStarts {
+    param(
+        [string]$PrincipalId,
+        [string]$RoleDefinitionId,
+        [string]$AccessToken
+    )
+
+    $filter = "principalId eq '$PrincipalId' and roleDefinitionId eq '$RoleDefinitionId' and action eq 'selfActivate'"
+    $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests?`$filter=$([System.Web.HttpUtility]::UrlEncode($filter))"
+
+    $existing = @{}
+    $response = Invoke-GraphRequest -Method GET -Uri $uri -AccessToken $AccessToken
+
+    foreach ($item in $response.value) {
+        $status = [string]$item.status
+        if ($status -match 'Denied|Failed|Canceled|Revoked') {
+            continue
+        }
+
+        if ($item.scheduleInfo -and $item.scheduleInfo.startDateTime) {
+            $utcStart = [datetime]::Parse($item.scheduleInfo.startDateTime).ToUniversalTime()
+            $existing[(Format-GraphDateTime -DateValue $utcStart)] = $true
+        }
+    }
+
+    return $existing
+}
+
+function New-ActivationRequest {
+    param(
+        [string]$PrincipalId,
+        [string]$RoleDefinitionId,
+        [datetime]$StartUtc,
+        [int]$DurationHours,
+        [string]$Reason,
+        [string]$AccessToken,
+        [switch]$IsDryRun
+    )
+
+    $body = @{
+        action = "selfActivate"
+        principalId = $PrincipalId
+        roleDefinitionId = $RoleDefinitionId
+        directoryScopeId = "/"
+        justification = $Reason
+        ticketInfo = @{
+            ticketNumber = "PIMELIM"
+            ticketSystem = "PIMELIM"
+        }
+        scheduleInfo = @{
+            startDateTime = (Format-GraphDateTime -DateValue $StartUtc)
+            expiration = @{
+                type = "afterDuration"
+                duration = "PT${DurationHours}H"
+            }
+        }
+    }
+
+    if ($IsDryRun) {
+        Write-Log -Message "[DryRun] Would create selfActivate request for start $(Format-GraphDateTime -DateValue $StartUtc)."
+        return
+    }
+
+    $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests"
+    $null = Invoke-GraphRequest -Method POST -Uri $uri -AccessToken $AccessToken -Body $body
+}
+
+function Invoke-Pimelim {
+    $scriptDir = Split-Path -Parent $PSCommandPath
+    $envPath = Resolve-PathSafe -BaseDirectory $scriptDir -PathValue $EnvFile
+    $envMap = Read-EnvFile -Path $envPath
+
+    $tenantId = Get-ConfigValue -EnvMap $envMap -Key "TENANT_ID"
+    $clientId = Get-ConfigValue -EnvMap $envMap -Key "CLIENT_ID"
+
+    if ([string]::IsNullOrWhiteSpace($tenantId) -or [string]::IsNullOrWhiteSpace($clientId)) {
+        throw "TENANT_ID and CLIENT_ID must be set in $envPath"
+    }
+
+    $duration = if ($PSBoundParameters.ContainsKey("DurationHours") -and $DurationHours -gt 0) {
+        $DurationHours
+    }
+    else {
+        [int](Get-ConfigValue -EnvMap $envMap -Key "PIM_ACTIVATION_DURATION_HOURS" -Default "8")
+    }
+
+    $futureWindowCount = if ($PSBoundParameters.ContainsKey("FutureWindows") -and $FutureWindows -gt 0) {
+        $FutureWindows
+    }
+    else {
+        [int](Get-ConfigValue -EnvMap $envMap -Key "PIM_FUTURE_WINDOWS" -Default "4")
+    }
+
+    $timezoneValue = if ($PSBoundParameters.ContainsKey("Timezone") -and -not [string]::IsNullOrWhiteSpace($Timezone)) {
+        $Timezone
+    }
+    else {
+        Get-ConfigValue -EnvMap $envMap -Key "PIM_TIMEZONE" -Default "UTC"
+    }
+
+    $logPathValue = Get-ConfigValue -EnvMap $envMap -Key "PIM_LOG_FILE" -Default "./pimelim.log"
+    $script:LogFilePath = Resolve-PathSafe -BaseDirectory $scriptDir -PathValue $logPathValue
+
+    $tokenCachePath = Resolve-PathSafe -BaseDirectory $scriptDir -PathValue ".token-cache.json"
+    $roles = Get-RoleConfigs -EnvMap $envMap
+
+    if ($roles.Count -eq 0) {
+        throw "No roles configured. Add PIM_ROLE_1_NAME/PIM_ROLE_1_REASON in $envPath"
+    }
+
+    if ($duration -le 0 -or $futureWindowCount -le 0) {
+        throw "PIM_ACTIVATION_DURATION_HOURS and PIM_FUTURE_WINDOWS must be positive integers."
+    }
+
+    $timezoneAdapter = Get-TimezoneAdapter -TimezoneValue $timezoneValue
+
+    Write-Log -Message "PIMELIM started. Roles=$($roles.Count), DurationHours=$duration, FutureWindows=$futureWindowCount, Timezone=$($timezoneAdapter.Name), DryRun=$DryRun"
+    $accessToken = Get-AccessToken -TenantId $tenantId -ClientId $clientId -TokenCachePath $tokenCachePath -AllowInteractive:$Bootstrap
+
+    $me = Invoke-GraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/me?`$select=id,userPrincipalName" -AccessToken $accessToken
+    $principalId = $me.id
+    Write-Log -Message "Using principal: $($me.userPrincipalName) ($principalId)"
+
+    $nowUtc = (Get-Date).ToUniversalTime()
+    $desiredStartsUtc = Get-DesiredStartTimesUtc -NowUtc $nowUtc -DurationHours $duration -FutureWindows $futureWindowCount -TimezoneAdapter $timezoneAdapter
+
+    foreach ($role in $roles) {
+        Write-Log -Message "Processing role '$($role.Name)'"
+
+        $roleDef = Get-RoleDefinitionByName -RoleName $role.Name -AccessToken $accessToken
+        $existingStarts = Get-ExistingScheduledStarts -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken
+
+        $created = 0
+        foreach ($startUtc in $desiredStartsUtc) {
+            $key = Format-GraphDateTime -DateValue $startUtc
+            if ($existingStarts.ContainsKey($key)) {
+                Write-Log -Message "Already scheduled at $key for role '$($role.Name)'."
+                continue
+            }
+
+            try {
+                New-ActivationRequest -PrincipalId $principalId -RoleDefinitionId $roleDef.id -StartUtc $startUtc -DurationHours $duration -Reason $role.Reason -AccessToken $accessToken -IsDryRun:$DryRun
+                $created++
+                Write-Log -Message "Scheduled activation at $key for role '$($role.Name)'."
+            }
+            catch {
+                Write-Log -Level "ERROR" -Message "Failed scheduling $key for role '$($role.Name)': $($_.Exception.Message)"
+            }
+        }
+
+        Write-Log -Message "Role '$($role.Name)' completed. Created=$created"
+    }
+
+    Write-Log -Message "PIMELIM completed."
+}
+
+try {
+    Invoke-Pimelim
+}
+catch {
+    Write-Log -Level "ERROR" -Message $_.Exception.Message
+    exit 1
+}
