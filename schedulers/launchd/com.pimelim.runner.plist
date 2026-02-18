@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.pimelim.runner</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/pwsh</string>
+    <string>-NoProfile</string>
+    <string>-File</string>
+    <string>/Users/CHANGE_ME/Code/PIMELIM/pimelim.ps1</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/CHANGE_ME/Code/PIMELIM</string>
+
+  <key>StartInterval</key>
+  <integer>1800</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/CHANGE_ME/Code/PIMELIM/launchd.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/CHANGE_ME/Code/PIMELIM/launchd.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run PIMELIM every 30 minutes
+
+[Timer]
+OnBootSec=3m
+OnUnitActiveSec=30m
+AccuracySec=1m
+Unit=pimelim.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

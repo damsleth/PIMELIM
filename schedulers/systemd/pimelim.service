@@ -1,0 +1,18 @@
+[Unit]
+Description=PIMELIM unattended PIM scheduler run
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=CHANGE_ME
+WorkingDirectory=/opt/pimelim
+ExecStart=/usr/bin/pwsh -NoProfile -File /opt/pimelim/pimelim.ps1
+
+# Optional hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
