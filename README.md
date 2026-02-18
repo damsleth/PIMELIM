@@ -59,6 +59,15 @@ Example systemd timer strategy (Ubuntu VPS):
 
 This cadence keeps future windows topped up and resilient to transient Graph/API failures.
 
+## Scheduler templates
+
+Ready-to-edit scheduler templates are included in:
+- `schedulers/systemd/pimelim.service`
+- `schedulers/systemd/pimelim.timer`
+- `schedulers/launchd/com.pimelim.runner.plist`
+
+See `schedulers/README.md` for setup steps.
+
 ## Configuration
 
 See `.env.example` for full template. Key settings:
