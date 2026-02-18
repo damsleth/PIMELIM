@@ -12,6 +12,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$script:LogFilePath = $null
 
 function Write-Log {
     param(
@@ -63,7 +64,7 @@ function Read-EnvFile {
         $key = $parts[0].Trim()
         $value = $parts[1].Trim()
 
-        if (($value.StartsWith("\"") -and $value.EndsWith("\"")) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
+        if (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
             $value = $value.Substring(1, $value.Length - 2)
         }
 
@@ -362,7 +363,7 @@ function Get-RoleDefinitionByName {
         [string]$AccessToken
     )
 
-    $encodedRoleName = [System.Web.HttpUtility]::UrlEncode("displayName eq '$RoleName'")
+    $encodedRoleName = [uri]::EscapeDataString("displayName eq '$RoleName'")
     $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions?`$filter=$encodedRoleName"
     $response = Invoke-GraphRequest -Method GET -Uri $uri -AccessToken $AccessToken
 
@@ -385,7 +386,7 @@ function Get-ExistingScheduledStarts {
     )
 
     $filter = "principalId eq '$PrincipalId' and roleDefinitionId eq '$RoleDefinitionId' and action eq 'selfActivate'"
-    $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests?`$filter=$([System.Web.HttpUtility]::UrlEncode($filter))"
+    $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests?`$filter=$([uri]::EscapeDataString($filter))"
 
     $existing = @{}
     $response = Invoke-GraphRequest -Method GET -Uri $uri -AccessToken $AccessToken
