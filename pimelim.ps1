@@ -66,12 +66,12 @@ Automate Azure Entra PIM self-activation requests for configured eligible roles.
 -ScheduledFutureActivations <int>
   Number of future back-to-back windows to schedule.
   Default: 0
-  Fallback: SCHEDULED_FUTURE_ACTIVATIONS in .env
+  Fallback: PIM_FUTURE_WINDOWS or SCHEDULED_FUTURE_ACTIVATIONS in .env
 
 -RoleDurationHours <int>
   Activation duration (hours).
   Default: 8
-  Fallback: ROLE_DURATION_HOURS in .env
+  Fallback: PIM_ACTIVATION_DURATION_HOURS or ROLE_DURATION_HOURS in .env
 
 -Bootstrap
     Forces interactive device-code login if needed.
@@ -99,6 +99,7 @@ Window count:
 
 Overlap safety:
 - Candidate windows that overlap existing non-failed requests are skipped.
+- If Graph reports overlap during create, the window is logged as skipped and execution continues.
 
 ## Requirements
 - PowerShell 7+
@@ -183,7 +184,7 @@ function Write-EnvFile {
     )
 
     $lines = [System.Collections.Generic.List[string]]::new()
-    foreach ($key in @("TENANT_ID", "CLIENT_ID", "NOW", "SCHEDULED_FUTURE_ACTIVATIONS", "ROLE_DURATION_HOURS", "PIM_LOG_FILE")) {
+    foreach ($key in @("TENANT_ID", "CLIENT_ID", "NOW", "PIM_FUTURE_WINDOWS", "PIM_ACTIVATION_DURATION_HOURS", "PIM_LOG_FILE")) {
         if ($EnvMap.ContainsKey($key)) {
             $lines.Add("$key=$($EnvMap[$key])")
         }
@@ -217,7 +218,7 @@ function Invoke-SetupWizard {
             Write-Host "Created .env from .env.example"
         }
         else {
-            Set-Content -Path $EnvPath -Value "TENANT_ID=`nCLIENT_ID=`nNOW=true`nSCHEDULED_FUTURE_ACTIVATIONS=0`nROLE_DURATION_HOURS=8`nPIM_LOG_FILE=./pimelim.log`n"
+            Set-Content -Path $EnvPath -Value "TENANT_ID=`nCLIENT_ID=`nNOW=true`nPIM_FUTURE_WINDOWS=0`nPIM_ACTIVATION_DURATION_HOURS=8`nPIM_LOG_FILE=./pimelim.log`n"
             Write-Host "Created new .env"
         }
     }
@@ -230,8 +231,12 @@ function Invoke-SetupWizard {
     $envMap["CLIENT_ID"] = Prompt-Value -Prompt "Client ID" -DefaultValue (Get-ConfigValue -EnvMap $envMap -Key "CLIENT_ID") -Required
 
     if (-not $envMap.ContainsKey("NOW")) { $envMap["NOW"] = "true" }
-    if (-not $envMap.ContainsKey("SCHEDULED_FUTURE_ACTIVATIONS")) { $envMap["SCHEDULED_FUTURE_ACTIVATIONS"] = "0" }
-    if (-not $envMap.ContainsKey("ROLE_DURATION_HOURS")) { $envMap["ROLE_DURATION_HOURS"] = "8" }
+    if (-not $envMap.ContainsKey("PIM_FUTURE_WINDOWS")) {
+        $envMap["PIM_FUTURE_WINDOWS"] = Get-ConfigValueFromKeys -EnvMap $envMap -Keys @("SCHEDULED_FUTURE_ACTIVATIONS") -Default "0"
+    }
+    if (-not $envMap.ContainsKey("PIM_ACTIVATION_DURATION_HOURS")) {
+        $envMap["PIM_ACTIVATION_DURATION_HOURS"] = Get-ConfigValueFromKeys -EnvMap $envMap -Keys @("ROLE_DURATION_HOURS") -Default "8"
+    }
     if (-not $envMap.ContainsKey("PIM_LOG_FILE")) { $envMap["PIM_LOG_FILE"] = "./pimelim.log" }
 
     $existingRoles = Get-RoleConfigsFromEnv -EnvMap $envMap
@@ -290,6 +295,16 @@ function Read-EnvFile {
 function Get-ConfigValue {
     param([hashtable]$EnvMap, [string]$Key, [string]$Default = "")
     if ($EnvMap.ContainsKey($Key) -and -not [string]::IsNullOrWhiteSpace($EnvMap[$Key])) { return $EnvMap[$Key] }
+    return $Default
+}
+
+function Get-ConfigValueFromKeys {
+    param([hashtable]$EnvMap, [string[]]$Keys, [string]$Default = "")
+    foreach ($key in $Keys) {
+        if ($EnvMap.ContainsKey($key) -and -not [string]::IsNullOrWhiteSpace($EnvMap[$key])) {
+            return $EnvMap[$key]
+        }
+    }
     return $Default
 }
 
@@ -665,6 +680,12 @@ function New-ActivationRequest {
     $null = Invoke-GraphRequest -Method POST -Uri $uri -AccessToken $AccessToken -Body $body
 }
 
+function Test-IsOverlapRequestError {
+    param([string]$ErrorMessage)
+    if ([string]::IsNullOrWhiteSpace($ErrorMessage)) { return $false }
+    return $ErrorMessage -match "OverlapsPendingRoleAssignmentRequests|overlaps existing role assignment requests"
+}
+
 function Invoke-Pimelim {
     $scriptDir = Split-Path -Parent $PSCommandPath
     $envPath = Resolve-PathSafe -BaseDirectory $scriptDir -PathValue $EnvFile
@@ -683,14 +704,14 @@ function Invoke-Pimelim {
         $ScheduledFutureActivations
     }
     else {
-        Convert-ToIntOrDefault -Value (Get-ConfigValue -EnvMap $envMap -Key "SCHEDULED_FUTURE_ACTIVATIONS") -Default 0
+        Convert-ToIntOrDefault -Value (Get-ConfigValueFromKeys -EnvMap $envMap -Keys @("PIM_FUTURE_WINDOWS", "SCHEDULED_FUTURE_ACTIVATIONS")) -Default 0
     }
 
     $resolvedDurationHours = if ($PSBoundParameters.ContainsKey("RoleDurationHours") -and $RoleDurationHours -gt 0) {
         $RoleDurationHours
     }
     else {
-        Convert-ToIntOrDefault -Value (Get-ConfigValue -EnvMap $envMap -Key "ROLE_DURATION_HOURS") -Default 8
+        Convert-ToIntOrDefault -Value (Get-ConfigValueFromKeys -EnvMap $envMap -Keys @("PIM_ACTIVATION_DURATION_HOURS", "ROLE_DURATION_HOURS")) -Default 8
     }
 
     if ($resolvedFuture -lt 0 -or $resolvedDurationHours -le 0) {
@@ -756,7 +777,7 @@ function Invoke-Pimelim {
             continue
         }
 
-        $existingIntervals = Get-ExistingScheduledIntervals -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken
+        $existingIntervals = @(Get-ExistingScheduledIntervals -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken)
 
         $created = 0
         foreach ($startUtc in $desiredStartsUtc) {
@@ -775,7 +796,14 @@ function Invoke-Pimelim {
                 Write-Log -Message "Scheduled activation at $key for role '$($role.Name)'."
             }
             catch {
-                Write-Log -Level "ERROR" -Message "Failed scheduling $key for role '$($role.Name)': $($_.Exception.Message)"
+                $errMessage = $_.Exception.Message
+                if (Test-IsOverlapRequestError -ErrorMessage $errMessage) {
+                    $existingIntervals += [PSCustomObject]@{ StartUtc = $startUtc; EndUtc = $candidateEndUtc }
+                    Write-Log -Level "WARN" -Message "Skipped overlap for role '$($role.Name)' at $key (reported by Graph on create)."
+                    continue
+                }
+
+                Write-Log -Level "ERROR" -Message "Failed scheduling $key for role '$($role.Name)': $errMessage"
             }
         }
 

@@ -24,10 +24,11 @@ It is built for your exact flow:
 - CLI parameters override `.env` values when provided
 - Uses delegated Graph auth via device-code on first run (`-Bootstrap`)
 - Stores refresh/access tokens in `.token-cache.json`
-- On each run, schedules per role using `Now` + `ScheduledFutureActivations`:
+- On each run, schedules per role using `Now` + `PIM_FUTURE_WINDOWS` (or CLI `-ScheduledFutureActivations`):
 	- active role: starts from current active end-time
 	- inactive role + `Now=true`: schedules immediately, then future windows
 	- inactive role + `Now=false`: schedules future-only windows
+- Overlapping windows are skipped. If Graph still returns an overlap on create, it is logged and treated as skipped.
 - Logs to console + local log file
 
 ## Prerequisites
@@ -139,8 +140,8 @@ See `.env.example` for full template. Key settings:
 
 - `TENANT_ID`, `CLIENT_ID`
 - `NOW` (default `true`)
-- `SCHEDULED_FUTURE_ACTIVATIONS` (default `0`)
-- `ROLE_DURATION_HOURS` (default `8`)
+- `PIM_FUTURE_WINDOWS` (default `0`, legacy alias: `SCHEDULED_FUTURE_ACTIVATIONS`)
+- `PIM_ACTIVATION_DURATION_HOURS` (default `8`, legacy alias: `ROLE_DURATION_HOURS`)
 - `PIM_LOG_FILE`
 - role blocks:
 	- `PIM_ROLE_1_NAME`, `PIM_ROLE_1_REASON`
