@@ -1,5 +1,7 @@
 # PIMELIM
 
+PIM (Privileged Identity Management) activation in Azure is a pain. You have to remember to activate your eligible roles before you need them, and if you want to keep a future activation window scheduled, you have to manually create a new schedule request every time one expires.  
+
 PIMELIM is a PowerShell tool for unattended scheduling of Azure Entra PIM role activations (for example, `Application Administrator` and `SharePoint Administrator`) using Microsoft Graph.
 
 It is built for your exact flow:
@@ -53,6 +55,38 @@ pwsh ./pimelim.ps1 -Bootstrap -Now $true -ScheduledFutureActivations 1 -RoleDura
 
 ```bash
 pwsh ./pimelim.ps1 -DryRun
+```
+
+## Usage Examples
+
+Use `.env` values only:
+
+```bash
+pwsh ./pimelim.ps1
+```
+
+Dry-run with `.env` values:
+
+```bash
+pwsh ./pimelim.ps1 -DryRun
+```
+
+PowerShell hashtable roles (recommended):
+
+```bash
+pwsh -NoProfile -Command '& ./pimelim.ps1 -Now true -ScheduledFutureActivations 1 -RoleDurationHours 8 -Roles @(@{name="Application Administrator";reason="apps are great"},@{name="SharePoint Administrator"})'
+```
+
+JSON roles input:
+
+```bash
+pwsh -NoProfile -Command '& ./pimelim.ps1 -Now true -ScheduledFutureActivations 1 -RoleDurationHours 8 -Roles ''[{"name":"Application Administrator","reason":"apps are great"},{"name":"SharePoint Administrator"}]''' 
+```
+
+Future-only scheduling (no immediate activation for inactive roles):
+
+```bash
+pwsh ./pimelim.ps1 -Now false -ScheduledFutureActivations 2
 ```
 
 ## Run unattended

@@ -99,11 +99,20 @@ Overlap safety:
 # Bootstrap once using .env
 pwsh ./pimelim.ps1 -Bootstrap
 
-# Dry-run with explicit overrides
+# Run with .env values only
+pwsh ./pimelim.ps1
+
+# Dry-run with .env values
+pwsh ./pimelim.ps1 -DryRun
+
+# Dry-run with explicit hashtable roles
 pwsh ./pimelim.ps1 -DryRun -TenantId "<tenant>" -ClientId "<client>" -Now $true -ScheduledFutureActivations 1 -RoleDurationHours 8 -Roles @(@{name="Application Administrator"}, @{name="SharePoint Administrator";reason="SharePoint ops"})
 
-# Unattended run (uses token cache)
-pwsh ./pimelim.ps1
+# Dry-run with JSON roles
+pwsh ./pimelim.ps1 -DryRun -Now true -ScheduledFutureActivations 1 -Roles '[{"name":"Application Administrator"},{"name":"SharePoint Administrator","reason":"SharePoint ops"}]'
+
+# Future-only scheduling (inactive roles are not activated immediately)
+pwsh ./pimelim.ps1 -Now false -ScheduledFutureActivations 2
 "@
 }
 

@@ -19,6 +19,22 @@ PIMELIM automatically keeps future Azure Entra PIM role activations scheduled fo
 - Role blocks: `PIM_ROLE_<N>_NAME`, `PIM_ROLE_<N>_REASON`
 - Optional: `NOW`, `SCHEDULED_FUTURE_ACTIVATIONS`, `ROLE_DURATION_HOURS`, `PIM_LOG_FILE`
 
+## Parameter contract
+- Supported CLI parameters:
+	- `-TenantId`, `-ClientId`
+	- `-Now`
+	- `-Roles` (hashtable array and JSON string forms)
+	- `-ScheduledFutureActivations`
+	- `-RoleDurationHours`
+	- `-Bootstrap`, `-DryRun`, `-Help`
+- Precedence: CLI parameters override `.env` values.
+- Role reason fallback: if role reason is missing, default reason to role name.
+
+## Help contract
+- `-Help` must print a structured, SKILL.md-like guide suitable for both humans and agents.
+- Keep sections explicit and stable: purpose, scope, parameters, behavior, requirements, examples.
+- When adding/changing parameters or behavior, update `-Help` and `README.md` in the same change.
+
 ## Safety and operations
 - Treat `.token-cache.json` as sensitive
 - Preserve idempotency (avoid duplicate schedule requests)
