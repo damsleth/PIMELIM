@@ -352,6 +352,21 @@ function Get-DesiredStartTimesUtc {
     return $starts
 }
 
+function Get-DesiredStartTimesFromAnchorUtc {
+    param(
+        [datetime]$FirstStartUtc,
+        [int]$DurationHours,
+        [int]$FutureWindows
+    )
+
+    $starts = @()
+    for ($i = 0; $i -lt $FutureWindows; $i++) {
+        $starts += $FirstStartUtc.AddHours($i * $DurationHours)
+    }
+
+    return $starts
+}
+
 function Format-GraphDateTime {
     param([datetime]$DateValue)
     return $DateValue.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -378,7 +393,36 @@ function Get-RoleDefinitionByName {
     return $response.value[0]
 }
 
-function Get-ExistingScheduledStarts {
+function Try-GetEndTimeFromScheduleInfo {
+    param(
+        [object]$ScheduleInfo,
+        [datetime]$StartUtc
+    )
+
+    if (-not $ScheduleInfo -or -not $ScheduleInfo.expiration) {
+        return $null
+    }
+
+    $expiration = $ScheduleInfo.expiration
+
+    if ($expiration.endDateTime) {
+        return [datetime]::Parse($expiration.endDateTime).ToUniversalTime()
+    }
+
+    if ($expiration.type -eq "afterDuration" -and $expiration.duration) {
+        try {
+            $duration = [System.Xml.XmlConvert]::ToTimeSpan([string]$expiration.duration)
+            return $StartUtc.Add($duration)
+        }
+        catch {
+            return $null
+        }
+    }
+
+    return $null
+}
+
+function Get-ExistingScheduledIntervals {
     param(
         [string]$PrincipalId,
         [string]$RoleDefinitionId,
@@ -388,7 +432,7 @@ function Get-ExistingScheduledStarts {
     $filter = "principalId eq '$PrincipalId' and roleDefinitionId eq '$RoleDefinitionId' and action eq 'selfActivate'"
     $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests?`$filter=$([uri]::EscapeDataString($filter))"
 
-    $existing = @{}
+    $intervals = @()
     $response = Invoke-GraphRequest -Method GET -Uri $uri -AccessToken $AccessToken
 
     foreach ($item in $response.value) {
@@ -399,11 +443,69 @@ function Get-ExistingScheduledStarts {
 
         if ($item.scheduleInfo -and $item.scheduleInfo.startDateTime) {
             $utcStart = [datetime]::Parse($item.scheduleInfo.startDateTime).ToUniversalTime()
-            $existing[(Format-GraphDateTime -DateValue $utcStart)] = $true
+            $utcEnd = Try-GetEndTimeFromScheduleInfo -ScheduleInfo $item.scheduleInfo -StartUtc $utcStart
+            if ($utcEnd -and $utcEnd -gt $utcStart) {
+                $intervals += [PSCustomObject]@{
+                    StartUtc = $utcStart
+                    EndUtc = $utcEnd
+                }
+            }
         }
     }
 
-    return $existing
+    return $intervals
+}
+
+function Test-IntervalOverlap {
+    param(
+        [datetime]$CandidateStartUtc,
+        [datetime]$CandidateEndUtc,
+        [object[]]$ExistingIntervals
+    )
+
+    foreach ($interval in $ExistingIntervals) {
+        if ($CandidateStartUtc -lt $interval.EndUtc -and $CandidateEndUtc -gt $interval.StartUtc) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-ActiveRoleAssignmentEndUtc {
+    param(
+        [string]$PrincipalId,
+        [string]$RoleDefinitionId,
+        [string]$AccessToken,
+        [datetime]$NowUtc
+    )
+
+    $filter = "principalId eq '$PrincipalId' and roleDefinitionId eq '$RoleDefinitionId'"
+    $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleInstances?`$filter=$([uri]::EscapeDataString($filter))"
+
+    $activeEnd = $null
+    while ($uri) {
+        $response = Invoke-GraphRequest -Method GET -Uri $uri -AccessToken $AccessToken
+
+        foreach ($item in $response.value) {
+            if (-not $item.startDateTime -or -not $item.endDateTime) {
+                continue
+            }
+
+            $startUtc = [datetime]::Parse($item.startDateTime).ToUniversalTime()
+            $endUtc = [datetime]::Parse($item.endDateTime).ToUniversalTime()
+
+            if ($startUtc -le $NowUtc -and $endUtc -gt $NowUtc) {
+                if (-not $activeEnd -or $endUtc -gt $activeEnd) {
+                    $activeEnd = $endUtc
+                }
+            }
+        }
+
+        $uri = $response.'@odata.nextLink'
+    }
+
+    return $activeEnd
 }
 
 function New-ActivationRequest {
@@ -502,25 +604,34 @@ function Invoke-Pimelim {
     Write-Log -Message "Using principal: $($me.userPrincipalName) ($principalId)"
 
     $nowUtc = (Get-Date).ToUniversalTime()
-    $desiredStartsUtc = Get-DesiredStartTimesUtc -NowUtc $nowUtc -DurationHours $duration -FutureWindows $futureWindowCount -TimezoneAdapter $timezoneAdapter
+    $defaultDesiredStartsUtc = Get-DesiredStartTimesUtc -NowUtc $nowUtc -DurationHours $duration -FutureWindows $futureWindowCount -TimezoneAdapter $timezoneAdapter
 
     foreach ($role in $roles) {
         Write-Log -Message "Processing role '$($role.Name)'"
 
         $roleDef = Get-RoleDefinitionByName -RoleName $role.Name -AccessToken $accessToken
-        $existingStarts = Get-ExistingScheduledStarts -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken
+        $existingIntervals = Get-ExistingScheduledIntervals -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken
+        $activeEndUtc = Get-ActiveRoleAssignmentEndUtc -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken -NowUtc $nowUtc
+
+        $desiredStartsUtc = $defaultDesiredStartsUtc
+        if ($activeEndUtc) {
+            $desiredStartsUtc = Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $activeEndUtc -DurationHours $duration -FutureWindows $futureWindowCount
+            Write-Log -Message "Role '$($role.Name)' is active until $(Format-GraphDateTime -DateValue $activeEndUtc). Scheduling next windows from active end-time."
+        }
 
         $created = 0
         foreach ($startUtc in $desiredStartsUtc) {
+            $candidateEndUtc = $startUtc.AddHours($duration)
             $key = Format-GraphDateTime -DateValue $startUtc
-            if ($existingStarts.ContainsKey($key)) {
-                Write-Log -Message "Already scheduled at $key for role '$($role.Name)'."
+            if (Test-IntervalOverlap -CandidateStartUtc $startUtc -CandidateEndUtc $candidateEndUtc -ExistingIntervals $existingIntervals) {
+                Write-Log -Message "Skipped overlap for role '$($role.Name)' at $key."
                 continue
             }
 
             try {
                 New-ActivationRequest -PrincipalId $principalId -RoleDefinitionId $roleDef.id -StartUtc $startUtc -DurationHours $duration -Reason $role.Reason -AccessToken $accessToken -IsDryRun:$DryRun
                 $created++
+                $existingIntervals += [PSCustomObject]@{ StartUtc = $startUtc; EndUtc = $candidateEndUtc }
                 Write-Log -Message "Scheduled activation at $key for role '$($role.Name)'."
             }
             catch {
