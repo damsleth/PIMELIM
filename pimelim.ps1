@@ -308,17 +308,11 @@ function Get-AccessToken {
         $cache = Get-Content -Path $TokenCachePath -Raw | ConvertFrom-Json
         $expiresAt = [DateTime]::MinValue
         if ($cache.expires_at_utc) {
-            $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
-            [datetime]$parsed = [datetime]::MinValue
-
-            if ([DateTime]::TryParseExact([string]$cache.expires_at_utc, "o", [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
-                $expiresAt = $parsed
+            try {
+                $expiresAt = Convert-ToUtcDateTime -Value $cache.expires_at_utc
             }
-            elseif ([DateTime]::TryParse([string]$cache.expires_at_utc, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
-                $expiresAt = $parsed
-            }
-            elseif ([DateTime]::TryParse([string]$cache.expires_at_utc, [System.Globalization.CultureInfo]::CurrentCulture, [System.Globalization.DateTimeStyles]::AssumeLocal, [ref]$parsed)) {
-                $expiresAt = $parsed.ToUniversalTime()
+            catch {
+                Write-Log -Level "WARN" -Message "Token cache expiry parse failed. Forcing refresh-token flow."
             }
         }
 
@@ -345,68 +339,6 @@ function Get-AccessToken {
     Write-Log -Message "Starting interactive bootstrap login."
     $bootstrapToken = Request-DeviceCodeToken -TenantId $TenantId -ClientId $ClientId -TokenCachePath $TokenCachePath
     return $bootstrapToken.access_token
-}
-
-function Get-TimezoneAdapter {
-    param([string]$TimezoneValue)
-
-    if ([string]::IsNullOrWhiteSpace($TimezoneValue)) {
-        $TimezoneValue = "UTC"
-    }
-
-    if ($TimezoneValue -match '^UTC([+\-])(\d{1,2})(?::?(\d{2}))?$') {
-        $sign = if ($matches[1] -eq "-") { -1 } else { 1 }
-        $hours = [int]$matches[2]
-        $minutes = if ($matches[3]) { [int]$matches[3] } else { 0 }
-        $offset = New-TimeSpan -Hours ($sign * $hours) -Minutes ($sign * $minutes)
-
-        return [PSCustomObject]@{
-            Kind = "Offset"
-            Offset = $offset
-            Name = $TimezoneValue
-        }
-    }
-
-    try {
-        return [PSCustomObject]@{
-            Kind = "TimeZoneInfo"
-            Value = [System.TimeZoneInfo]::FindSystemTimeZoneById($TimezoneValue)
-            Name = $TimezoneValue
-        }
-    }
-    catch {
-        throw "Unsupported timezone '$TimezoneValue'. Use UTC, UTC+1, UTC-05:00, or a valid system timezone ID."
-    }
-}
-
-function Convert-UtcToLocal {
-    param($Adapter, [datetime]$UtcDateTime)
-
-    if ($Adapter.Kind -eq "Offset") {
-        return [datetimeoffset]::new($UtcDateTime, [timespan]::Zero).ToOffset($Adapter.Offset).DateTime
-    }
-
-    return [System.TimeZoneInfo]::ConvertTimeFromUtc($UtcDateTime, $Adapter.Value)
-}
-
-function Convert-LocalToUtc {
-    param($Adapter, [datetime]$LocalDateTime)
-
-    if ($Adapter.Kind -eq "Offset") {
-        $dto = [datetimeoffset]::new($LocalDateTime, $Adapter.Offset)
-        return $dto.UtcDateTime
-    }
-
-    return [System.TimeZoneInfo]::ConvertTimeToUtc($LocalDateTime, $Adapter.Value)
-}
-
-function Get-DesiredStartTimesUtc {
-    param(
-        [datetime]$NowUtc,
-        [int]$DurationHours,
-        [int]$FutureWindows
-    )
-    return Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $NowUtc -DurationHours $DurationHours -FutureWindows $FutureWindows
 }
 
 function Get-DesiredStartTimesFromAnchorUtc {
@@ -441,7 +373,7 @@ function Get-RoleDefinitionByName {
     while ($uri) {
         $response = Invoke-GraphRequest -Method GET -Uri $uri -AccessToken $AccessToken
         foreach ($item in $response.value) {
-            if ($item.displayName -and $item.displayName.Trim().ToLowerInvariant() -eq $RoleName.Trim().ToLowerInvariant()) {
+            if ($item.displayName -and $item.displayName.Trim().Equals($RoleName.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
                 $matches += $item
             }
         }
@@ -500,28 +432,32 @@ function Get-ExistingScheduledIntervals {
     $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests?`$filter=$([uri]::EscapeDataString($filter))"
 
     $intervals = @()
-    $response = Invoke-GraphRequest -Method GET -Uri $uri -AccessToken $AccessToken
+    while ($uri) {
+        $response = Invoke-GraphRequest -Method GET -Uri $uri -AccessToken $AccessToken
 
-    foreach ($item in $response.value) {
-        $status = [string]$item.status
-        if ($status -match 'Denied|Failed|Canceled|Revoked') {
-            continue
-        }
+        foreach ($item in $response.value) {
+            $status = [string]$item.status
+            if ($status -match 'Denied|Failed|Canceled|Revoked') {
+                continue
+            }
 
-        if ($item.action -and [string]$item.action -ne 'selfActivate') {
-            continue
-        }
+            if ($item.action -and [string]$item.action -ne 'selfActivate') {
+                continue
+            }
 
-        if ($item.scheduleInfo -and $item.scheduleInfo.startDateTime) {
-            $utcStart = Convert-ToUtcDateTime -Value $item.scheduleInfo.startDateTime
-            $utcEnd = Try-GetEndTimeFromScheduleInfo -ScheduleInfo $item.scheduleInfo -StartUtc $utcStart
-            if ($utcEnd -and $utcEnd -gt $utcStart) {
-                $intervals += [PSCustomObject]@{
-                    StartUtc = $utcStart
-                    EndUtc = $utcEnd
+            if ($item.scheduleInfo -and $item.scheduleInfo.startDateTime) {
+                $utcStart = Convert-ToUtcDateTime -Value $item.scheduleInfo.startDateTime
+                $utcEnd = Try-GetEndTimeFromScheduleInfo -ScheduleInfo $item.scheduleInfo -StartUtc $utcStart
+                if ($utcEnd -and $utcEnd -gt $utcStart) {
+                    $intervals += [PSCustomObject]@{
+                        StartUtc = $utcStart
+                        EndUtc = $utcEnd
+                    }
                 }
             }
         }
+
+        $uri = Get-GraphNextLink -Response $response
     }
 
     return $intervals
@@ -676,14 +612,13 @@ function Invoke-Pimelim {
     $principalId = $me.id
     Write-Log -Message "Using principal: $($me.userPrincipalName) ($principalId)"
 
-    $nowUtc = (Get-Date).ToUniversalTime()
-
     foreach ($role in $roles) {
         Write-Log -Message "Processing role '$($role.Name)'"
 
+        $roleNowUtc = (Get-Date).ToUniversalTime()
         $roleDef = Get-RoleDefinitionByName -RoleName $role.Name -AccessToken $accessToken
         $existingIntervals = Get-ExistingScheduledIntervals -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken
-        $activeEndUtc = Get-ActiveRoleAssignmentEndUtc -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken -NowUtc $nowUtc
+        $activeEndUtc = Get-ActiveRoleAssignmentEndUtc -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken -NowUtc $roleNowUtc
 
         $desiredStartsUtc = @()
         if ($activeEndUtc) {
@@ -691,8 +626,7 @@ function Invoke-Pimelim {
             Write-Log -Message "Role '$($role.Name)' is active until $(Format-GraphDateTime -DateValue $activeEndUtc). Scheduling next windows from active end-time."
         }
         else {
-            $roleNowUtc = (Get-Date).ToUniversalTime()
-            $desiredStartsUtc = Get-DesiredStartTimesUtc -NowUtc $roleNowUtc -DurationHours $duration -FutureWindows $futureWindowCount
+            $desiredStartsUtc = Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $roleNowUtc -DurationHours $duration -FutureWindows $futureWindowCount
             Write-Log -Message "Role '$($role.Name)' is inactive. Scheduling from now ($(Format-GraphDateTime -DateValue $roleNowUtc))."
         }
 
