@@ -333,23 +333,9 @@ function Get-DesiredStartTimesUtc {
     param(
         [datetime]$NowUtc,
         [int]$DurationHours,
-        [int]$FutureWindows,
-        $TimezoneAdapter
+        [int]$FutureWindows
     )
-
-    $nowLocal = Convert-UtcToLocal -Adapter $TimezoneAdapter -UtcDateTime $NowUtc
-    $localMidnight = $nowLocal.Date
-    $hoursSinceMidnight = ($nowLocal - $localMidnight).TotalHours
-    $currentSlot = [math]::Floor($hoursSinceMidnight / $DurationHours)
-    $firstLocalStart = $localMidnight.AddHours(($currentSlot + 1) * $DurationHours)
-
-    $starts = @()
-    for ($i = 0; $i -lt $FutureWindows; $i++) {
-        $localStart = $firstLocalStart.AddHours($i * $DurationHours)
-        $starts += Convert-LocalToUtc -Adapter $TimezoneAdapter -LocalDateTime $localStart
-    }
-
-    return $starts
+    return Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $NowUtc -DurationHours $DurationHours -FutureWindows $FutureWindows
 }
 
 function Get-DesiredStartTimesFromAnchorUtc {
@@ -577,7 +563,7 @@ function Invoke-Pimelim {
         $Timezone
     }
     else {
-        Get-ConfigValue -EnvMap $envMap -Key "PIM_TIMEZONE" -Default "UTC"
+        Get-ConfigValue -EnvMap $envMap -Key "PIM_TIMEZONE"
     }
 
     $logPathValue = Get-ConfigValue -EnvMap $envMap -Key "PIM_LOG_FILE" -Default "./pimelim.log"
@@ -594,9 +580,11 @@ function Invoke-Pimelim {
         throw "PIM_ACTIVATION_DURATION_HOURS and PIM_FUTURE_WINDOWS must be positive integers."
     }
 
-    $timezoneAdapter = Get-TimezoneAdapter -TimezoneValue $timezoneValue
+    if (-not [string]::IsNullOrWhiteSpace($timezoneValue)) {
+        Write-Log -Level "WARN" -Message "PIM_TIMEZONE is ignored. Scheduling uses rolling windows anchored to now or active end-time."
+    }
 
-    Write-Log -Message "PIMELIM started. Roles=$($roles.Count), DurationHours=$duration, FutureWindows=$futureWindowCount, Timezone=$($timezoneAdapter.Name), DryRun=$DryRun"
+    Write-Log -Message "PIMELIM started. Roles=$($roles.Count), DurationHours=$duration, FutureWindows=$futureWindowCount, DryRun=$DryRun"
     $accessToken = Get-AccessToken -TenantId $tenantId -ClientId $clientId -TokenCachePath $tokenCachePath -AllowInteractive:$Bootstrap
 
     $me = Invoke-GraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/me?`$select=id,userPrincipalName" -AccessToken $accessToken
@@ -604,7 +592,6 @@ function Invoke-Pimelim {
     Write-Log -Message "Using principal: $($me.userPrincipalName) ($principalId)"
 
     $nowUtc = (Get-Date).ToUniversalTime()
-    $defaultDesiredStartsUtc = Get-DesiredStartTimesUtc -NowUtc $nowUtc -DurationHours $duration -FutureWindows $futureWindowCount -TimezoneAdapter $timezoneAdapter
 
     foreach ($role in $roles) {
         Write-Log -Message "Processing role '$($role.Name)'"
@@ -613,10 +600,15 @@ function Invoke-Pimelim {
         $existingIntervals = Get-ExistingScheduledIntervals -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken
         $activeEndUtc = Get-ActiveRoleAssignmentEndUtc -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken -NowUtc $nowUtc
 
-        $desiredStartsUtc = $defaultDesiredStartsUtc
+        $desiredStartsUtc = @()
         if ($activeEndUtc) {
             $desiredStartsUtc = Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $activeEndUtc -DurationHours $duration -FutureWindows $futureWindowCount
             Write-Log -Message "Role '$($role.Name)' is active until $(Format-GraphDateTime -DateValue $activeEndUtc). Scheduling next windows from active end-time."
+        }
+        else {
+            $roleNowUtc = (Get-Date).ToUniversalTime()
+            $desiredStartsUtc = Get-DesiredStartTimesUtc -NowUtc $roleNowUtc -DurationHours $duration -FutureWindows $futureWindowCount
+            Write-Log -Message "Role '$($role.Name)' is inactive. Scheduling from now ($(Format-GraphDateTime -DateValue $roleNowUtc))."
         }
 
         $created = 0

@@ -17,7 +17,8 @@ PIMELIM automatically keeps future Azure Entra PIM role activations scheduled fo
 ## Configuration contract
 - Required keys: `TENANT_ID`, `CLIENT_ID`
 - Role blocks: `PIM_ROLE_<N>_NAME`, `PIM_ROLE_<N>_REASON`
-- Optional: `PIM_TIMEZONE`, `PIM_FUTURE_WINDOWS`, `PIM_ACTIVATION_DURATION_HOURS`, `PIM_LOG_FILE`
+- Optional: `PIM_FUTURE_WINDOWS`, `PIM_ACTIVATION_DURATION_HOURS`, `PIM_LOG_FILE`
+- Legacy/ignored: `PIM_TIMEZONE`
 
 ## Safety and operations
 - Treat `.token-cache.json` as sensitive

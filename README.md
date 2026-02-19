@@ -13,7 +13,9 @@ It is built for your exact flow:
 - Reads local settings from `.env` in the same folder as `pimelim.ps1`
 - Uses delegated Graph auth via device-code on first run (`-Bootstrap`)
 - Stores refresh/access tokens in `.token-cache.json`
-- On each run, ensures each configured role has N future activation windows scheduled
+- On each run, ensures each configured role has N rolling windows scheduled:
+	- active role: starts from current active end-time
+	- inactive role: starts from now
 - Logs to console + local log file
 
 ## Prerequisites
@@ -73,7 +75,6 @@ See `schedulers/README.md` for setup steps.
 See `.env.example` for full template. Key settings:
 
 - `TENANT_ID`, `CLIENT_ID`
-- `PIM_TIMEZONE` (example `UTC+1`)
 - `PIM_ACTIVATION_DURATION_HOURS` (typically `8`)
 - `PIM_FUTURE_WINDOWS` (how many future windows to keep queued)
 - `PIM_LOG_FILE`
@@ -87,3 +88,4 @@ See `.env.example` for full template. Key settings:
 - `.token-cache.json` is sensitive; keep permissions tight (`chmod 600`).
 - If refresh token becomes invalid/revoked, rerun with `-Bootstrap`.
 - This tool only creates `selfActivate` schedule requests; it does not grant role eligibility.
+- `PIM_TIMEZONE` is currently legacy/ignored.
