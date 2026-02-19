@@ -136,8 +136,12 @@ function Invoke-GraphRequest {
         catch {
             $attempt++
             $statusCode = $null
+            $details = $null
             if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
                 $statusCode = [int]$_.Exception.Response.StatusCode
+            }
+            if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+                $details = $_.ErrorDetails.Message
             }
 
             if ($attempt -lt $maxAttempts -and (($statusCode -eq 429) -or ($statusCode -ge 500 -and $statusCode -lt 600))) {
@@ -147,9 +151,62 @@ function Invoke-GraphRequest {
                 continue
             }
 
-            throw
+            if ($details) {
+                throw "Graph $Method $Uri failed with status $statusCode. Details: $details"
+            }
+
+            throw "Graph $Method $Uri failed with status $statusCode. Error: $($_.Exception.Message)"
         }
     }
+}
+
+function Get-GraphNextLink {
+    param([object]$Response)
+
+    if (-not $Response -or -not $Response.PSObject -or -not $Response.PSObject.Properties) {
+        return $null
+    }
+
+    $next = $Response.PSObject.Properties['@odata.nextLink']
+    if ($next) {
+        return [string]$next.Value
+    }
+
+    return $null
+}
+
+function Convert-ToUtcDateTime {
+    param([object]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    if ($Value -is [datetime]) {
+        return ([datetime]$Value).ToUniversalTime()
+    }
+
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return $null
+    }
+
+    $stylesUtc = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+    [datetime]$parsed = [datetime]::MinValue
+
+    if ([DateTime]::TryParseExact($text, "o", [System.Globalization.CultureInfo]::InvariantCulture, $stylesUtc, [ref]$parsed)) {
+        return $parsed
+    }
+
+    if ([DateTime]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture, $stylesUtc, [ref]$parsed)) {
+        return $parsed
+    }
+
+    if ([DateTime]::TryParse($text, [System.Globalization.CultureInfo]::CurrentCulture, [System.Globalization.DateTimeStyles]::AssumeLocal, [ref]$parsed)) {
+        return $parsed.ToUniversalTime()
+    }
+
+    throw "Unable to parse datetime value '$text'."
 }
 
 function Save-TokenCache {
@@ -249,7 +306,21 @@ function Get-AccessToken {
 
     if (Test-Path -Path $TokenCachePath) {
         $cache = Get-Content -Path $TokenCachePath -Raw | ConvertFrom-Json
-        $expiresAt = [DateTime]::Parse($cache.expires_at_utc).ToUniversalTime()
+        $expiresAt = [DateTime]::MinValue
+        if ($cache.expires_at_utc) {
+            $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+            [datetime]$parsed = [datetime]::MinValue
+
+            if ([DateTime]::TryParseExact([string]$cache.expires_at_utc, "o", [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
+                $expiresAt = $parsed
+            }
+            elseif ([DateTime]::TryParse([string]$cache.expires_at_utc, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
+                $expiresAt = $parsed
+            }
+            elseif ([DateTime]::TryParse([string]$cache.expires_at_utc, [System.Globalization.CultureInfo]::CurrentCulture, [System.Globalization.DateTimeStyles]::AssumeLocal, [ref]$parsed)) {
+                $expiresAt = $parsed.ToUniversalTime()
+            }
+        }
 
         if ($cache.access_token -and $expiresAt -gt (Get-Date).ToUniversalTime().AddMinutes(5)) {
             return $cache.access_token
@@ -364,19 +435,29 @@ function Get-RoleDefinitionByName {
         [string]$AccessToken
     )
 
-    $encodedRoleName = [uri]::EscapeDataString("displayName eq '$RoleName'")
-    $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions?`$filter=$encodedRoleName"
-    $response = Invoke-GraphRequest -Method GET -Uri $uri -AccessToken $AccessToken
+    $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions"
+    $matches = @()
 
-    if (-not $response.value -or $response.value.Count -eq 0) {
+    while ($uri) {
+        $response = Invoke-GraphRequest -Method GET -Uri $uri -AccessToken $AccessToken
+        foreach ($item in $response.value) {
+            if ($item.displayName -and $item.displayName.Trim().ToLowerInvariant() -eq $RoleName.Trim().ToLowerInvariant()) {
+                $matches += $item
+            }
+        }
+
+        $uri = Get-GraphNextLink -Response $response
+    }
+
+    if ($matches.Count -eq 0) {
         throw "Role '$RoleName' not found in tenant role definitions."
     }
 
-    if ($response.value.Count -gt 1) {
+    if ($matches.Count -gt 1) {
         Write-Log -Level "WARN" -Message "Multiple role definitions matched '$RoleName'. Using first match."
     }
 
-    return $response.value[0]
+    return $matches[0]
 }
 
 function Try-GetEndTimeFromScheduleInfo {
@@ -392,7 +473,7 @@ function Try-GetEndTimeFromScheduleInfo {
     $expiration = $ScheduleInfo.expiration
 
     if ($expiration.endDateTime) {
-        return [datetime]::Parse($expiration.endDateTime).ToUniversalTime()
+        return Convert-ToUtcDateTime -Value $expiration.endDateTime
     }
 
     if ($expiration.type -eq "afterDuration" -and $expiration.duration) {
@@ -415,7 +496,7 @@ function Get-ExistingScheduledIntervals {
         [string]$AccessToken
     )
 
-    $filter = "principalId eq '$PrincipalId' and roleDefinitionId eq '$RoleDefinitionId' and action eq 'selfActivate'"
+    $filter = "principalId eq '$PrincipalId' and roleDefinitionId eq '$RoleDefinitionId'"
     $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests?`$filter=$([uri]::EscapeDataString($filter))"
 
     $intervals = @()
@@ -427,8 +508,12 @@ function Get-ExistingScheduledIntervals {
             continue
         }
 
+        if ($item.action -and [string]$item.action -ne 'selfActivate') {
+            continue
+        }
+
         if ($item.scheduleInfo -and $item.scheduleInfo.startDateTime) {
-            $utcStart = [datetime]::Parse($item.scheduleInfo.startDateTime).ToUniversalTime()
+            $utcStart = Convert-ToUtcDateTime -Value $item.scheduleInfo.startDateTime
             $utcEnd = Try-GetEndTimeFromScheduleInfo -ScheduleInfo $item.scheduleInfo -StartUtc $utcStart
             if ($utcEnd -and $utcEnd -gt $utcStart) {
                 $intervals += [PSCustomObject]@{
@@ -478,8 +563,8 @@ function Get-ActiveRoleAssignmentEndUtc {
                 continue
             }
 
-            $startUtc = [datetime]::Parse($item.startDateTime).ToUniversalTime()
-            $endUtc = [datetime]::Parse($item.endDateTime).ToUniversalTime()
+            $startUtc = Convert-ToUtcDateTime -Value $item.startDateTime
+            $endUtc = Convert-ToUtcDateTime -Value $item.endDateTime
 
             if ($startUtc -le $NowUtc -and $endUtc -gt $NowUtc) {
                 if (-not $activeEnd -or $endUtc -gt $activeEnd) {
@@ -488,7 +573,7 @@ function Get-ActiveRoleAssignmentEndUtc {
             }
         }
 
-        $uri = $response.'@odata.nextLink'
+        $uri = Get-GraphNextLink -Response $response
     }
 
     return $activeEnd
