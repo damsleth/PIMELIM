@@ -6,16 +6,18 @@ It is built for your exact flow:
 - one-time interactive sign-in bootstrap
 - local token cache with refresh
 - recurring unattended runs from cron/systemd/Task Scheduler
-- pre-scheduling several future 8-hour windows to reduce manual reauth pressure
+- optional immediate activation + configurable future back-to-back windows
 
 ## How it works
 
 - Reads local settings from `.env` in the same folder as `pimelim.ps1`
+- CLI parameters override `.env` values when provided
 - Uses delegated Graph auth via device-code on first run (`-Bootstrap`)
 - Stores refresh/access tokens in `.token-cache.json`
-- On each run, ensures each configured role has N rolling windows scheduled:
+- On each run, schedules per role using `Now` + `ScheduledFutureActivations`:
 	- active role: starts from current active end-time
-	- inactive role: starts from now
+	- inactive role + `Now=true`: schedules immediately, then future windows
+	- inactive role + `Now=false`: schedules future-only windows
 - Logs to console + local log file
 
 ## Prerequisites
@@ -39,6 +41,12 @@ It is built for your exact flow:
 
 ```bash
 pwsh ./pimelim.ps1 -Bootstrap
+```
+
+Or bootstrap with explicit CLI parameters:
+
+```bash
+pwsh ./pimelim.ps1 -Bootstrap -Now $true -ScheduledFutureActivations 1 -RoleDurationHours 8 -Roles @(@{name="Application Administrator";reason="apps are great"},@{name="SharePoint Administrator"})
 ```
 
 4. Validate without writing requests:
@@ -75,17 +83,31 @@ See `schedulers/README.md` for setup steps.
 See `.env.example` for full template. Key settings:
 
 - `TENANT_ID`, `CLIENT_ID`
-- `PIM_ACTIVATION_DURATION_HOURS` (typically `8`)
-- `PIM_FUTURE_WINDOWS` (how many future windows to keep queued)
+- `NOW` (default `true`)
+- `SCHEDULED_FUTURE_ACTIVATIONS` (default `0`)
+- `ROLE_DURATION_HOURS` (default `8`)
 - `PIM_LOG_FILE`
 - role blocks:
 	- `PIM_ROLE_1_NAME`, `PIM_ROLE_1_REASON`
 	- `PIM_ROLE_2_NAME`, `PIM_ROLE_2_REASON`
 	- and so on
 
+## CLI Parameters
+
+- `-TenantId <string>`
+- `-ClientId <string>`
+- `-Now <bool>`
+- `-Roles <object[]>` (hashtable array or JSON string)
+- `-ScheduledFutureActivations <int>`
+- `-RoleDurationHours <int>`
+- `-Bootstrap`
+- `-DryRun`
+- `-Help`
+
+`-Help` prints a structured guide intended for both human and AI-agent readability.
+
 ## Notes
 
 - `.token-cache.json` is sensitive; keep permissions tight (`chmod 600`).
 - If refresh token becomes invalid/revoked, rerun with `-Bootstrap`.
 - This tool only creates `selfActivate` schedule requests; it does not grant role eligibility.
-- `PIM_TIMEZONE` is currently legacy/ignored.

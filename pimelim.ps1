@@ -3,16 +3,109 @@
 [CmdletBinding()]
 param(
     [string]$EnvFile = ".env",
+    [string]$TenantId,
+    [string]$ClientId,
+    [string]$Now,
+    [object[]]$Roles,
+    [int]$ScheduledFutureActivations = -1,
+    [int]$RoleDurationHours = -1,
     [switch]$Bootstrap,
     [switch]$DryRun,
-    [int]$FutureWindows,
-    [int]$DurationHours,
-    [string]$Timezone
+    [Alias("h")][switch]$Help
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $script:LogFilePath = $null
+
+function Show-PimelimHelp {
+    @"
+# PIMELIM CLI Help
+
+## Purpose
+Automate Azure Entra PIM self-activation requests for configured eligible roles.
+
+## Scope
+- Runtime: PowerShell 7 script
+- Auth: Device-code bootstrap + refresh-token cache
+- Supports unattended runs (cron/systemd/launchd)
+
+## Parameters
+-TenantId <string>
+  Entra tenant ID or domain.
+  Fallback: TENANT_ID in .env
+
+-ClientId <string>
+  App registration client ID.
+  Fallback: CLIENT_ID in .env
+
+-Now <bool>
+  If true and role is inactive, schedule immediate activation window.
+  Default: true
+  Fallback: NOW in .env (true/false)
+
+-Roles <object[]>
+  Array/list of role objects. Supported input:
+  1) Hashtable array literal (recommended):
+     -Roles @(@{name="Application Administrator";reason="apps are great"}, @{name="SharePoint Administrator"})
+  2) JSON string:
+     -Roles '[{"name":"Application Administrator","reason":"apps are great"}]'
+
+  Required field: name
+  Optional field: reason
+  If reason is missing/blank, reason defaults to name.
+  Fallback: PIM_ROLE_<N>_NAME and PIM_ROLE_<N>_REASON in .env
+
+-ScheduledFutureActivations <int>
+  Number of future back-to-back windows to schedule.
+  Default: 0
+  Fallback: SCHEDULED_FUTURE_ACTIVATIONS in .env
+
+-RoleDurationHours <int>
+  Activation duration (hours).
+  Default: 8
+  Fallback: ROLE_DURATION_HOURS in .env
+
+-Bootstrap
+  Enables interactive device-code login when no valid token cache exists.
+
+-DryRun
+  Logs planned requests without creating schedule requests.
+
+-Help
+  Prints this guide.
+
+## Scheduling Behavior
+Per role:
+- If role is currently active: schedule from active end-time.
+- If role is inactive and Now=true: schedule from now.
+- If role is inactive and Now=false: schedule only future windows from now + duration.
+
+Window count:
+- Active role: ScheduledFutureActivations windows.
+- Inactive role + Now=true: 1 immediate + ScheduledFutureActivations future windows.
+- Inactive role + Now=false: ScheduledFutureActivations future windows.
+
+Overlap safety:
+- Candidate windows that overlap existing non-failed requests are skipped.
+
+## Requirements
+- PowerShell 7+
+- Entra app registration with delegated Graph permissions:
+  RoleManagement.ReadWrite.Directory, offline_access, openid, profile
+- Eligible PIM role assignments for target roles
+
+## Examples
+# Bootstrap once using .env
+pwsh ./pimelim.ps1 -Bootstrap
+
+# Dry-run with explicit overrides
+pwsh ./pimelim.ps1 -DryRun -TenantId "<tenant>" -ClientId "<client>" -Now $true -ScheduledFutureActivations 1 -RoleDurationHours 8 -Roles @(@{name="Application Administrator"}, @{name="SharePoint Administrator";reason="SharePoint ops"})
+
+# Unattended run (uses token cache)
+pwsh ./pimelim.ps1
+"@
+}
 
 function Write-Log {
     param(
@@ -23,92 +116,158 @@ function Write-Log {
     $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
     $line = "[$timestamp][$Level] $Message"
     Write-Host $line
-
     if ($script:LogFilePath) {
         Add-Content -Path $script:LogFilePath -Value $line
     }
 }
 
 function Resolve-PathSafe {
-    param(
-        [Parameter(Mandatory = $true)][string]$BaseDirectory,
-        [Parameter(Mandatory = $true)][string]$PathValue
-    )
-
-    if ([System.IO.Path]::IsPathRooted($PathValue)) {
-        return [System.IO.Path]::GetFullPath($PathValue)
-    }
-
+    param([Parameter(Mandatory = $true)][string]$BaseDirectory, [Parameter(Mandatory = $true)][string]$PathValue)
+    if ([System.IO.Path]::IsPathRooted($PathValue)) { return [System.IO.Path]::GetFullPath($PathValue) }
     return [System.IO.Path]::GetFullPath((Join-Path $BaseDirectory $PathValue))
 }
 
 function Read-EnvFile {
     param([Parameter(Mandatory = $true)][string]$Path)
-
     $envMap = @{}
-    if (-not (Test-Path -Path $Path)) {
-        return $envMap
-    }
+    if (-not (Test-Path -Path $Path)) { return $envMap }
 
     foreach ($rawLine in Get-Content -Path $Path) {
         $line = $rawLine.Trim()
-        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith("#")) {
-            continue
-        }
-
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith("#")) { continue }
         $parts = $line.Split("=", 2)
-        if ($parts.Count -ne 2) {
-            continue
-        }
+        if ($parts.Count -ne 2) { continue }
 
         $key = $parts[0].Trim()
         $value = $parts[1].Trim()
-
         if (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
             $value = $value.Substring(1, $value.Length - 2)
         }
-
         $envMap[$key] = $value
     }
-
     return $envMap
 }
 
 function Get-ConfigValue {
-    param(
-        [hashtable]$EnvMap,
-        [string]$Key,
-        [string]$Default = ""
-    )
-
-    if ($EnvMap.ContainsKey($Key) -and -not [string]::IsNullOrWhiteSpace($EnvMap[$Key])) {
-        return $EnvMap[$Key]
-    }
-
+    param([hashtable]$EnvMap, [string]$Key, [string]$Default = "")
+    if ($EnvMap.ContainsKey($Key) -and -not [string]::IsNullOrWhiteSpace($EnvMap[$Key])) { return $EnvMap[$Key] }
     return $Default
 }
 
-function Get-RoleConfigs {
-    param([hashtable]$EnvMap)
+function Convert-ToUtcDateTime {
+    param([object]$Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) { return ([datetime]$Value).ToUniversalTime() }
+
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+
+    $stylesUtc = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+    [datetime]$parsed = [datetime]::MinValue
+    if ([DateTime]::TryParseExact($text, "o", [System.Globalization.CultureInfo]::InvariantCulture, $stylesUtc, [ref]$parsed)) { return $parsed }
+    if ([DateTime]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture, $stylesUtc, [ref]$parsed)) { return $parsed }
+    if ([DateTime]::TryParse($text, [System.Globalization.CultureInfo]::CurrentCulture, [System.Globalization.DateTimeStyles]::AssumeLocal, [ref]$parsed)) { return $parsed.ToUniversalTime() }
+    throw "Unable to parse datetime value '$text'."
+}
+
+function Convert-ToBoolean {
+    param([string]$Value, [bool]$Default)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $Default }
+    $v = $Value.Trim().ToLowerInvariant()
+    if ($v -in @("1", "true", "yes", "y", "on")) { return $true }
+    if ($v -in @("0", "false", "no", "n", "off")) { return $false }
+    return $Default
+}
+
+function Convert-ToIntOrDefault {
+    param([string]$Value, [int]$Default)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $Default }
+    $parsed = 0
+    if ([int]::TryParse($Value, [ref]$parsed)) { return $parsed }
+    return $Default
+}
+
+function Get-GraphNextLink {
+    param([object]$Response)
+    if (-not $Response -or -not $Response.PSObject -or -not $Response.PSObject.Properties) { return $null }
+    $next = $Response.PSObject.Properties['@odata.nextLink']
+    if ($next) { return [string]$next.Value }
+    return $null
+}
+
+function Resolve-RoleObjectsFromInput {
+    param([object[]]$RolesInput)
+
+    if (-not $RolesInput -or $RolesInput.Count -eq 0) { return @() }
+
+    $expanded = @()
+    foreach ($entry in $RolesInput) {
+        if ($entry -is [string] -and $entry.Trim().StartsWith("[")) {
+            $jsonRoles = $entry | ConvertFrom-Json
+            if ($jsonRoles -is [System.Collections.IEnumerable]) {
+                foreach ($jsonRole in $jsonRoles) { $expanded += $jsonRole }
+            }
+            else {
+                $expanded += $jsonRoles
+            }
+        }
+        else {
+            $expanded += $entry
+        }
+    }
 
     $roles = @()
-    $index = 1
+    foreach ($entry in $expanded) {
+        $name = $null
+        $reason = $null
 
+        if ($entry -is [hashtable]) {
+            if ($entry.ContainsKey("name")) { $name = [string]$entry["name"] }
+            elseif ($entry.ContainsKey("Name")) { $name = [string]$entry["Name"] }
+
+            if ($entry.ContainsKey("reason")) { $reason = [string]$entry["reason"] }
+            elseif ($entry.ContainsKey("Reason")) { $reason = [string]$entry["Reason"] }
+        }
+        else {
+            $propName = $entry.PSObject.Properties["name"]
+            if (-not $propName) { $propName = $entry.PSObject.Properties["Name"] }
+            $propReason = $entry.PSObject.Properties["reason"]
+            if (-not $propReason) { $propReason = $entry.PSObject.Properties["Reason"] }
+
+            if ($propName) { $name = [string]$propName.Value }
+            if ($propReason) { $reason = [string]$propReason.Value }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            throw "Each role must provide 'name'."
+        }
+
+        if ([string]::IsNullOrWhiteSpace($reason)) {
+            $reason = $name
+        }
+
+        $roles += [PSCustomObject]@{ Name = $name.Trim(); Reason = $reason.Trim() }
+    }
+
+    return $roles
+}
+
+function Get-RoleConfigsFromEnv {
+    param([hashtable]$EnvMap)
+    $roles = @()
+    $index = 1
     while ($true) {
         $nameKey = "PIM_ROLE_${index}_NAME"
         $reasonKey = "PIM_ROLE_${index}_REASON"
+        if (-not $EnvMap.ContainsKey($nameKey) -or [string]::IsNullOrWhiteSpace($EnvMap[$nameKey])) { break }
 
-        if (-not $EnvMap.ContainsKey($nameKey) -or [string]::IsNullOrWhiteSpace($EnvMap[$nameKey])) {
-            break
-        }
+        $name = $EnvMap[$nameKey].Trim()
+        $reason = (Get-ConfigValue -EnvMap $EnvMap -Key $reasonKey -Default $name).Trim()
+        if ([string]::IsNullOrWhiteSpace($reason)) { $reason = $name }
 
-        $roles += [PSCustomObject]@{
-            Name = $EnvMap[$nameKey].Trim()
-            Reason = (Get-ConfigValue -EnvMap $EnvMap -Key $reasonKey -Default "Scheduled activation by PIMELIM")
-        }
+        $roles += [PSCustomObject]@{ Name = $name; Reason = $reason }
         $index++
     }
-
     return $roles
 }
 
@@ -130,19 +289,14 @@ function Invoke-GraphRequest {
                 $json = $Body | ConvertTo-Json -Depth 10
                 return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -Body $json -ContentType "application/json"
             }
-
             return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers
         }
         catch {
             $attempt++
             $statusCode = $null
             $details = $null
-            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
-                $statusCode = [int]$_.Exception.Response.StatusCode
-            }
-            if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-                $details = $_.ErrorDetails.Message
-            }
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) { $statusCode = [int]$_.Exception.Response.StatusCode }
+            if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $details = $_.ErrorDetails.Message }
 
             if ($attempt -lt $maxAttempts -and (($statusCode -eq 429) -or ($statusCode -ge 500 -and $statusCode -lt 600))) {
                 $sleepSeconds = [math]::Min(30, [math]::Pow(2, $attempt))
@@ -151,99 +305,31 @@ function Invoke-GraphRequest {
                 continue
             }
 
-            if ($details) {
-                throw "Graph $Method $Uri failed with status $statusCode. Details: $details"
-            }
-
+            if ($details) { throw "Graph $Method $Uri failed with status $statusCode. Details: $details" }
             throw "Graph $Method $Uri failed with status $statusCode. Error: $($_.Exception.Message)"
         }
     }
 }
 
-function Get-GraphNextLink {
-    param([object]$Response)
-
-    if (-not $Response -or -not $Response.PSObject -or -not $Response.PSObject.Properties) {
-        return $null
-    }
-
-    $next = $Response.PSObject.Properties['@odata.nextLink']
-    if ($next) {
-        return [string]$next.Value
-    }
-
-    return $null
-}
-
-function Convert-ToUtcDateTime {
-    param([object]$Value)
-
-    if ($null -eq $Value) {
-        return $null
-    }
-
-    if ($Value -is [datetime]) {
-        return ([datetime]$Value).ToUniversalTime()
-    }
-
-    $text = [string]$Value
-    if ([string]::IsNullOrWhiteSpace($text)) {
-        return $null
-    }
-
-    $stylesUtc = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
-    [datetime]$parsed = [datetime]::MinValue
-
-    if ([DateTime]::TryParseExact($text, "o", [System.Globalization.CultureInfo]::InvariantCulture, $stylesUtc, [ref]$parsed)) {
-        return $parsed
-    }
-
-    if ([DateTime]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture, $stylesUtc, [ref]$parsed)) {
-        return $parsed
-    }
-
-    if ([DateTime]::TryParse($text, [System.Globalization.CultureInfo]::CurrentCulture, [System.Globalization.DateTimeStyles]::AssumeLocal, [ref]$parsed)) {
-        return $parsed.ToUniversalTime()
-    }
-
-    throw "Unable to parse datetime value '$text'."
-}
-
 function Save-TokenCache {
-    param(
-        [string]$Path,
-        [object]$TokenResponse
-    )
-
-    if (-not $TokenResponse.refresh_token) {
-        return
-    }
-
+    param([string]$Path, [object]$TokenResponse)
+    if (-not $TokenResponse.refresh_token) { return }
     $cache = [PSCustomObject]@{
         access_token = $TokenResponse.access_token
         refresh_token = $TokenResponse.refresh_token
         expires_at_utc = (Get-Date).ToUniversalTime().AddSeconds([int]$TokenResponse.expires_in).ToString("o")
     }
-
     $cache | ConvertTo-Json | Set-Content -Path $Path
 }
 
 function Request-DeviceCodeToken {
-    param(
-        [Parameter(Mandatory = $true)][string]$TenantId,
-        [Parameter(Mandatory = $true)][string]$ClientId,
-        [Parameter(Mandatory = $true)][string]$TokenCachePath
-    )
+    param([string]$TenantId, [string]$ClientId, [string]$TokenCachePath)
 
     $scope = "https://graph.microsoft.com/.default offline_access openid profile"
     $deviceCodeUri = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/devicecode"
     $tokenUri = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
 
-    $deviceResponse = Invoke-RestMethod -Method POST -Uri $deviceCodeUri -ContentType "application/x-www-form-urlencoded" -Body @{
-        client_id = $ClientId
-        scope = $scope
-    }
-
+    $deviceResponse = Invoke-RestMethod -Method POST -Uri $deviceCodeUri -ContentType "application/x-www-form-urlencoded" -Body @{ client_id = $ClientId; scope = $scope }
     Write-Log -Message $deviceResponse.message
 
     $pollInterval = [int]$deviceResponse.interval
@@ -251,74 +337,49 @@ function Request-DeviceCodeToken {
 
     while ((Get-Date) -lt $expiresAt) {
         Start-Sleep -Seconds $pollInterval
-
         try {
             $tokenResponse = Invoke-RestMethod -Method POST -Uri $tokenUri -ContentType "application/x-www-form-urlencoded" -Body @{
                 grant_type = "urn:ietf:params:oauth:grant-type:device_code"
                 client_id = $ClientId
                 device_code = $deviceResponse.device_code
             }
-
             Save-TokenCache -Path $TokenCachePath -TokenResponse $tokenResponse
             return $tokenResponse
         }
         catch {
             $detail = $_.ErrorDetails.Message
-            if ($detail -and $detail -match "authorization_pending|slow_down") {
-                continue
-            }
-
+            if ($detail -and $detail -match "authorization_pending|slow_down") { continue }
             throw
         }
     }
-
     throw "Device-code login timed out."
 }
 
 function Request-RefreshToken {
-    param(
-        [Parameter(Mandatory = $true)][string]$TenantId,
-        [Parameter(Mandatory = $true)][string]$ClientId,
-        [Parameter(Mandatory = $true)][string]$RefreshToken,
-        [Parameter(Mandatory = $true)][string]$TokenCachePath
-    )
+    param([string]$TenantId, [string]$ClientId, [string]$RefreshToken, [string]$TokenCachePath)
 
     $tokenUri = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
-
     $tokenResponse = Invoke-RestMethod -Method POST -Uri $tokenUri -ContentType "application/x-www-form-urlencoded" -Body @{
         grant_type = "refresh_token"
         client_id = $ClientId
         refresh_token = $RefreshToken
         scope = "https://graph.microsoft.com/.default offline_access openid profile"
     }
-
     Save-TokenCache -Path $TokenCachePath -TokenResponse $tokenResponse
     return $tokenResponse
 }
 
 function Get-AccessToken {
-    param(
-        [string]$TenantId,
-        [string]$ClientId,
-        [string]$TokenCachePath,
-        [switch]$AllowInteractive
-    )
+    param([string]$TenantId, [string]$ClientId, [string]$TokenCachePath, [switch]$AllowInteractive)
 
     if (Test-Path -Path $TokenCachePath) {
         $cache = Get-Content -Path $TokenCachePath -Raw | ConvertFrom-Json
         $expiresAt = [DateTime]::MinValue
         if ($cache.expires_at_utc) {
-            try {
-                $expiresAt = Convert-ToUtcDateTime -Value $cache.expires_at_utc
-            }
-            catch {
-                Write-Log -Level "WARN" -Message "Token cache expiry parse failed. Forcing refresh-token flow."
-            }
+            try { $expiresAt = Convert-ToUtcDateTime -Value $cache.expires_at_utc } catch { Write-Log -Level "WARN" -Message "Token cache expiry parse failed. Forcing refresh-token flow." }
         }
 
-        if ($cache.access_token -and $expiresAt -gt (Get-Date).ToUniversalTime().AddMinutes(5)) {
-            return $cache.access_token
-        }
+        if ($cache.access_token -and $expiresAt -gt (Get-Date).ToUniversalTime().AddMinutes(5)) { return $cache.access_token }
 
         if ($cache.refresh_token) {
             try {
@@ -332,27 +393,15 @@ function Get-AccessToken {
         }
     }
 
-    if (-not $AllowInteractive) {
-        throw "No valid token cache available. Run once with -Bootstrap to complete device login."
-    }
-
+    if (-not $AllowInteractive) { throw "No valid token cache available. Run once with -Bootstrap to complete device login." }
     Write-Log -Message "Starting interactive bootstrap login."
-    $bootstrapToken = Request-DeviceCodeToken -TenantId $TenantId -ClientId $ClientId -TokenCachePath $TokenCachePath
-    return $bootstrapToken.access_token
+    return (Request-DeviceCodeToken -TenantId $TenantId -ClientId $ClientId -TokenCachePath $TokenCachePath).access_token
 }
 
 function Get-DesiredStartTimesFromAnchorUtc {
-    param(
-        [datetime]$FirstStartUtc,
-        [int]$DurationHours,
-        [int]$FutureWindows
-    )
-
+    param([datetime]$FirstStartUtc, [int]$DurationHours, [int]$WindowCount)
     $starts = @()
-    for ($i = 0; $i -lt $FutureWindows; $i++) {
-        $starts += $FirstStartUtc.AddHours($i * $DurationHours)
-    }
-
+    for ($i = 0; $i -lt $WindowCount; $i++) { $starts += $FirstStartUtc.AddHours($i * $DurationHours) }
     return $starts
 }
 
@@ -362,14 +411,10 @@ function Format-GraphDateTime {
 }
 
 function Get-RoleDefinitionByName {
-    param(
-        [string]$RoleName,
-        [string]$AccessToken
-    )
+    param([string]$RoleName, [string]$AccessToken)
 
     $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions"
     $matches = @()
-
     while ($uri) {
         $response = Invoke-GraphRequest -Method GET -Uri $uri -AccessToken $AccessToken
         foreach ($item in $response.value) {
@@ -377,138 +422,79 @@ function Get-RoleDefinitionByName {
                 $matches += $item
             }
         }
-
         $uri = Get-GraphNextLink -Response $response
     }
 
-    if ($matches.Count -eq 0) {
-        throw "Role '$RoleName' not found in tenant role definitions."
-    }
-
-    if ($matches.Count -gt 1) {
-        Write-Log -Level "WARN" -Message "Multiple role definitions matched '$RoleName'. Using first match."
-    }
-
+    if ($matches.Count -eq 0) { throw "Role '$RoleName' not found in tenant role definitions." }
+    if ($matches.Count -gt 1) { Write-Log -Level "WARN" -Message "Multiple role definitions matched '$RoleName'. Using first match." }
     return $matches[0]
 }
 
 function Try-GetEndTimeFromScheduleInfo {
-    param(
-        [object]$ScheduleInfo,
-        [datetime]$StartUtc
-    )
-
-    if (-not $ScheduleInfo -or -not $ScheduleInfo.expiration) {
-        return $null
-    }
+    param([object]$ScheduleInfo, [datetime]$StartUtc)
+    if (-not $ScheduleInfo -or -not $ScheduleInfo.expiration) { return $null }
 
     $expiration = $ScheduleInfo.expiration
-
-    if ($expiration.endDateTime) {
-        return Convert-ToUtcDateTime -Value $expiration.endDateTime
-    }
-
+    if ($expiration.endDateTime) { return Convert-ToUtcDateTime -Value $expiration.endDateTime }
     if ($expiration.type -eq "afterDuration" -and $expiration.duration) {
-        try {
-            $duration = [System.Xml.XmlConvert]::ToTimeSpan([string]$expiration.duration)
-            return $StartUtc.Add($duration)
-        }
-        catch {
-            return $null
-        }
+        try { return $StartUtc.Add([System.Xml.XmlConvert]::ToTimeSpan([string]$expiration.duration)) } catch { return $null }
     }
-
     return $null
 }
 
 function Get-ExistingScheduledIntervals {
-    param(
-        [string]$PrincipalId,
-        [string]$RoleDefinitionId,
-        [string]$AccessToken
-    )
+    param([string]$PrincipalId, [string]$RoleDefinitionId, [string]$AccessToken)
 
     $filter = "principalId eq '$PrincipalId' and roleDefinitionId eq '$RoleDefinitionId'"
     $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests?`$filter=$([uri]::EscapeDataString($filter))"
-
     $intervals = @()
+
     while ($uri) {
         $response = Invoke-GraphRequest -Method GET -Uri $uri -AccessToken $AccessToken
-
         foreach ($item in $response.value) {
             $status = [string]$item.status
-            if ($status -match 'Denied|Failed|Canceled|Revoked') {
-                continue
-            }
-
-            if ($item.action -and [string]$item.action -ne 'selfActivate') {
-                continue
-            }
+            if ($status -match 'Denied|Failed|Canceled|Revoked') { continue }
+            if ($item.action -and [string]$item.action -ne 'selfActivate') { continue }
 
             if ($item.scheduleInfo -and $item.scheduleInfo.startDateTime) {
-                $utcStart = Convert-ToUtcDateTime -Value $item.scheduleInfo.startDateTime
-                $utcEnd = Try-GetEndTimeFromScheduleInfo -ScheduleInfo $item.scheduleInfo -StartUtc $utcStart
-                if ($utcEnd -and $utcEnd -gt $utcStart) {
-                    $intervals += [PSCustomObject]@{
-                        StartUtc = $utcStart
-                        EndUtc = $utcEnd
-                    }
+                $startUtc = Convert-ToUtcDateTime -Value $item.scheduleInfo.startDateTime
+                $endUtc = Try-GetEndTimeFromScheduleInfo -ScheduleInfo $item.scheduleInfo -StartUtc $startUtc
+                if ($endUtc -and $endUtc -gt $startUtc) {
+                    $intervals += [PSCustomObject]@{ StartUtc = $startUtc; EndUtc = $endUtc }
                 }
             }
         }
-
         $uri = Get-GraphNextLink -Response $response
     }
-
     return $intervals
 }
 
 function Test-IntervalOverlap {
-    param(
-        [datetime]$CandidateStartUtc,
-        [datetime]$CandidateEndUtc,
-        [object[]]$ExistingIntervals
-    )
-
+    param([datetime]$CandidateStartUtc, [datetime]$CandidateEndUtc, [object[]]$ExistingIntervals)
     foreach ($interval in $ExistingIntervals) {
-        if ($CandidateStartUtc -lt $interval.EndUtc -and $CandidateEndUtc -gt $interval.StartUtc) {
-            return $true
-        }
+        if ($CandidateStartUtc -lt $interval.EndUtc -and $CandidateEndUtc -gt $interval.StartUtc) { return $true }
     }
-
     return $false
 }
 
 function Get-ActiveRoleAssignmentEndUtc {
-    param(
-        [string]$PrincipalId,
-        [string]$RoleDefinitionId,
-        [string]$AccessToken,
-        [datetime]$NowUtc
-    )
+    param([string]$PrincipalId, [string]$RoleDefinitionId, [string]$AccessToken, [datetime]$NowUtc)
 
     $filter = "principalId eq '$PrincipalId' and roleDefinitionId eq '$RoleDefinitionId'"
     $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleInstances?`$filter=$([uri]::EscapeDataString($filter))"
-
     $activeEnd = $null
+
     while ($uri) {
         $response = Invoke-GraphRequest -Method GET -Uri $uri -AccessToken $AccessToken
-
         foreach ($item in $response.value) {
-            if (-not $item.startDateTime -or -not $item.endDateTime) {
-                continue
-            }
-
+            if (-not $item.startDateTime -or -not $item.endDateTime) { continue }
             $startUtc = Convert-ToUtcDateTime -Value $item.startDateTime
             $endUtc = Convert-ToUtcDateTime -Value $item.endDateTime
 
             if ($startUtc -le $NowUtc -and $endUtc -gt $NowUtc) {
-                if (-not $activeEnd -or $endUtc -gt $activeEnd) {
-                    $activeEnd = $endUtc
-                }
+                if (-not $activeEnd -or $endUtc -gt $activeEnd) { $activeEnd = $endUtc }
             }
         }
-
         $uri = Get-GraphNextLink -Response $response
     }
 
@@ -516,15 +502,7 @@ function Get-ActiveRoleAssignmentEndUtc {
 }
 
 function New-ActivationRequest {
-    param(
-        [string]$PrincipalId,
-        [string]$RoleDefinitionId,
-        [datetime]$StartUtc,
-        [int]$DurationHours,
-        [string]$Reason,
-        [string]$AccessToken,
-        [switch]$IsDryRun
-    )
+    param([string]$PrincipalId, [string]$RoleDefinitionId, [datetime]$StartUtc, [int]$DurationHours, [string]$Reason, [string]$AccessToken, [switch]$IsDryRun)
 
     $body = @{
         action = "selfActivate"
@@ -532,16 +510,10 @@ function New-ActivationRequest {
         roleDefinitionId = $RoleDefinitionId
         directoryScopeId = "/"
         justification = $Reason
-        ticketInfo = @{
-            ticketNumber = "PIMELIM"
-            ticketSystem = "PIMELIM"
-        }
+        ticketInfo = @{ ticketNumber = "PIMELIM"; ticketSystem = "PIMELIM" }
         scheduleInfo = @{
             startDateTime = (Format-GraphDateTime -DateValue $StartUtc)
-            expiration = @{
-                type = "afterDuration"
-                duration = "PT${DurationHours}H"
-            }
+            expiration = @{ type = "afterDuration"; duration = "PT${DurationHours}H" }
         }
     }
 
@@ -559,88 +531,98 @@ function Invoke-Pimelim {
     $envPath = Resolve-PathSafe -BaseDirectory $scriptDir -PathValue $EnvFile
     $envMap = Read-EnvFile -Path $envPath
 
-    $tenantId = Get-ConfigValue -EnvMap $envMap -Key "TENANT_ID"
-    $clientId = Get-ConfigValue -EnvMap $envMap -Key "CLIENT_ID"
+    $resolvedTenantId = if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $TenantId } else { Get-ConfigValue -EnvMap $envMap -Key "TENANT_ID" }
+    $resolvedClientId = if (-not [string]::IsNullOrWhiteSpace($ClientId)) { $ClientId } else { Get-ConfigValue -EnvMap $envMap -Key "CLIENT_ID" }
 
-    if ([string]::IsNullOrWhiteSpace($tenantId) -or [string]::IsNullOrWhiteSpace($clientId)) {
-        throw "TENANT_ID and CLIENT_ID must be set in $envPath"
+    if ([string]::IsNullOrWhiteSpace($resolvedTenantId) -or [string]::IsNullOrWhiteSpace($resolvedClientId)) {
+        throw "TenantId/ClientId are required. Provide CLI values or TENANT_ID/CLIENT_ID in $envPath"
     }
 
-    $duration = if ($PSBoundParameters.ContainsKey("DurationHours") -and $DurationHours -gt 0) {
-        $DurationHours
+    $resolvedNow = Convert-ToBoolean -Value $(if (-not [string]::IsNullOrWhiteSpace([string]$Now)) { [string]$Now } else { Get-ConfigValue -EnvMap $envMap -Key "NOW" }) -Default $true
+
+    $resolvedFuture = if ($PSBoundParameters.ContainsKey("ScheduledFutureActivations") -and $ScheduledFutureActivations -ge 0) {
+        $ScheduledFutureActivations
     }
     else {
-        [int](Get-ConfigValue -EnvMap $envMap -Key "PIM_ACTIVATION_DURATION_HOURS" -Default "8")
+        Convert-ToIntOrDefault -Value (Get-ConfigValue -EnvMap $envMap -Key "SCHEDULED_FUTURE_ACTIVATIONS") -Default 0
     }
 
-    $futureWindowCount = if ($PSBoundParameters.ContainsKey("FutureWindows") -and $FutureWindows -gt 0) {
-        $FutureWindows
+    $resolvedDurationHours = if ($PSBoundParameters.ContainsKey("RoleDurationHours") -and $RoleDurationHours -gt 0) {
+        $RoleDurationHours
     }
     else {
-        [int](Get-ConfigValue -EnvMap $envMap -Key "PIM_FUTURE_WINDOWS" -Default "4")
+        Convert-ToIntOrDefault -Value (Get-ConfigValue -EnvMap $envMap -Key "ROLE_DURATION_HOURS") -Default 8
     }
 
-    $timezoneValue = if ($PSBoundParameters.ContainsKey("Timezone") -and -not [string]::IsNullOrWhiteSpace($Timezone)) {
-        $Timezone
+    if ($resolvedFuture -lt 0 -or $resolvedDurationHours -le 0) {
+        throw "ScheduledFutureActivations must be >= 0 and RoleDurationHours must be > 0."
+    }
+
+    $resolvedRoles = if ($null -ne $Roles -and @($Roles).Count -gt 0) {
+        Resolve-RoleObjectsFromInput -RolesInput $Roles
     }
     else {
-        Get-ConfigValue -EnvMap $envMap -Key "PIM_TIMEZONE"
+        Get-RoleConfigsFromEnv -EnvMap $envMap
+    }
+
+    if (-not $resolvedRoles -or $resolvedRoles.Count -eq 0) {
+        throw "No roles configured. Provide -Roles or PIM_ROLE_<N>_NAME in $envPath"
     }
 
     $logPathValue = Get-ConfigValue -EnvMap $envMap -Key "PIM_LOG_FILE" -Default "./pimelim.log"
     $script:LogFilePath = Resolve-PathSafe -BaseDirectory $scriptDir -PathValue $logPathValue
-
     $tokenCachePath = Resolve-PathSafe -BaseDirectory $scriptDir -PathValue ".token-cache.json"
-    $roles = Get-RoleConfigs -EnvMap $envMap
 
-    if ($roles.Count -eq 0) {
-        throw "No roles configured. Add PIM_ROLE_1_NAME/PIM_ROLE_1_REASON in $envPath"
-    }
-
-    if ($duration -le 0 -or $futureWindowCount -le 0) {
-        throw "PIM_ACTIVATION_DURATION_HOURS and PIM_FUTURE_WINDOWS must be positive integers."
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($timezoneValue)) {
-        Write-Log -Level "WARN" -Message "PIM_TIMEZONE is ignored. Scheduling uses rolling windows anchored to now or active end-time."
-    }
-
-    Write-Log -Message "PIMELIM started. Roles=$($roles.Count), DurationHours=$duration, FutureWindows=$futureWindowCount, DryRun=$DryRun"
-    $accessToken = Get-AccessToken -TenantId $tenantId -ClientId $clientId -TokenCachePath $tokenCachePath -AllowInteractive:$Bootstrap
+    Write-Log -Message "PIMELIM started. Roles=$($resolvedRoles.Count), Now=$resolvedNow, Future=$resolvedFuture, DurationHours=$resolvedDurationHours, DryRun=$DryRun"
+    $accessToken = Get-AccessToken -TenantId $resolvedTenantId -ClientId $resolvedClientId -TokenCachePath $tokenCachePath -AllowInteractive:$Bootstrap
 
     $me = Invoke-GraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/me?`$select=id,userPrincipalName" -AccessToken $accessToken
     $principalId = $me.id
     Write-Log -Message "Using principal: $($me.userPrincipalName) ($principalId)"
 
-    foreach ($role in $roles) {
+    foreach ($role in $resolvedRoles) {
         Write-Log -Message "Processing role '$($role.Name)'"
 
         $roleNowUtc = (Get-Date).ToUniversalTime()
         $roleDef = Get-RoleDefinitionByName -RoleName $role.Name -AccessToken $accessToken
-        $existingIntervals = Get-ExistingScheduledIntervals -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken
         $activeEndUtc = Get-ActiveRoleAssignmentEndUtc -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken -NowUtc $roleNowUtc
 
         $desiredStartsUtc = @()
         if ($activeEndUtc) {
-            $desiredStartsUtc = Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $activeEndUtc -DurationHours $duration -FutureWindows $futureWindowCount
-            Write-Log -Message "Role '$($role.Name)' is active until $(Format-GraphDateTime -DateValue $activeEndUtc). Scheduling next windows from active end-time."
+            $desiredStartsUtc = @(Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $activeEndUtc -DurationHours $resolvedDurationHours -WindowCount $resolvedFuture)
+            Write-Log -Message "Role '$($role.Name)' is active until $(Format-GraphDateTime -DateValue $activeEndUtc). Scheduling $resolvedFuture future window(s)."
         }
         else {
-            $desiredStartsUtc = Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $roleNowUtc -DurationHours $duration -FutureWindows $futureWindowCount
-            Write-Log -Message "Role '$($role.Name)' is inactive. Scheduling from now ($(Format-GraphDateTime -DateValue $roleNowUtc))."
+            $windowCount = if ($resolvedNow) { $resolvedFuture + 1 } else { $resolvedFuture }
+            if ($windowCount -gt 0) {
+                $anchor = if ($resolvedNow) { $roleNowUtc } else { $roleNowUtc.AddHours($resolvedDurationHours) }
+                $desiredStartsUtc = @(Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $anchor -DurationHours $resolvedDurationHours -WindowCount $windowCount)
+                Write-Log -Message "Role '$($role.Name)' is inactive. Scheduling $windowCount window(s) from $(Format-GraphDateTime -DateValue $anchor)."
+            }
+            else {
+                Write-Log -Message "Role '$($role.Name)' is inactive. No activation requested (Now=false and ScheduledFutureActivations=0)."
+            }
         }
+
+        if (@($desiredStartsUtc).Count -eq 0) {
+            Write-Log -Message "Role '$($role.Name)' completed. Created=0"
+            continue
+        }
+
+        $existingIntervals = Get-ExistingScheduledIntervals -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken
 
         $created = 0
         foreach ($startUtc in $desiredStartsUtc) {
-            $candidateEndUtc = $startUtc.AddHours($duration)
+            $candidateEndUtc = $startUtc.AddHours($resolvedDurationHours)
             $key = Format-GraphDateTime -DateValue $startUtc
+
             if (Test-IntervalOverlap -CandidateStartUtc $startUtc -CandidateEndUtc $candidateEndUtc -ExistingIntervals $existingIntervals) {
                 Write-Log -Message "Skipped overlap for role '$($role.Name)' at $key."
                 continue
             }
 
             try {
-                New-ActivationRequest -PrincipalId $principalId -RoleDefinitionId $roleDef.id -StartUtc $startUtc -DurationHours $duration -Reason $role.Reason -AccessToken $accessToken -IsDryRun:$DryRun
+                New-ActivationRequest -PrincipalId $principalId -RoleDefinitionId $roleDef.id -StartUtc $startUtc -DurationHours $resolvedDurationHours -Reason $role.Reason -AccessToken $accessToken -IsDryRun:$DryRun
                 $created++
                 $existingIntervals += [PSCustomObject]@{ StartUtc = $startUtc; EndUtc = $candidateEndUtc }
                 Write-Log -Message "Scheduled activation at $key for role '$($role.Name)'."
@@ -657,6 +639,11 @@ function Invoke-Pimelim {
 }
 
 try {
+    if ($Help) {
+        Show-PimelimHelp
+        exit 0
+    }
+
     Invoke-Pimelim
 }
 catch {
