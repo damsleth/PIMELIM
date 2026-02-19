@@ -3,6 +3,7 @@
 [CmdletBinding()]
 param(
     [string]$EnvFile = ".env",
+    [switch]$Setup,
     [string]$TenantId,
     [string]$ClientId,
     [string]$Now,
@@ -31,6 +32,12 @@ Automate Azure Entra PIM self-activation requests for configured eligible roles.
 - Supports unattended runs (cron/systemd/launchd)
 
 ## Parameters
+-Setup
+    Interactive first-run wizard:
+    - creates .env from .env.example if missing
+    - prompts for TenantId, ClientId, and at least one role+reason
+    - runs bootstrap login
+
 -TenantId <string>
   Entra tenant ID or domain.
   Fallback: TENANT_ID in .env
@@ -67,13 +74,17 @@ Automate Azure Entra PIM self-activation requests for configured eligible roles.
   Fallback: ROLE_DURATION_HOURS in .env
 
 -Bootstrap
-  Enables interactive device-code login when no valid token cache exists.
+    Forces interactive device-code login if needed.
+    If token cache is missing, bootstrap is auto-enabled even without this switch.
 
 -DryRun
   Logs planned requests without creating schedule requests.
 
 -Help
   Prints this guide.
+
+Default behavior:
+- If run with no parameters and no .env exists, help is printed.
 
 ## Scheduling Behavior
 Per role:
@@ -96,6 +107,9 @@ Overlap safety:
 - Eligible PIM role assignments for target roles
 
 ## Examples
+# Interactive setup wizard (recommended first run)
+pwsh ./pimelim.ps1 -Setup
+
 # Bootstrap once using .env
 pwsh ./pimelim.ps1 -Bootstrap
 
@@ -134,6 +148,122 @@ function Resolve-PathSafe {
     param([Parameter(Mandatory = $true)][string]$BaseDirectory, [Parameter(Mandatory = $true)][string]$PathValue)
     if ([System.IO.Path]::IsPathRooted($PathValue)) { return [System.IO.Path]::GetFullPath($PathValue) }
     return [System.IO.Path]::GetFullPath((Join-Path $BaseDirectory $PathValue))
+}
+
+function Prompt-Value {
+    param(
+        [Parameter(Mandatory = $true)][string]$Prompt,
+        [string]$DefaultValue = "",
+        [switch]$Required
+    )
+
+    while ($true) {
+        $suffix = if (-not [string]::IsNullOrWhiteSpace($DefaultValue)) { " [$DefaultValue]" } else { "" }
+        $input = Read-Host "$Prompt$suffix"
+
+        if ([string]::IsNullOrWhiteSpace($input)) {
+            if (-not [string]::IsNullOrWhiteSpace($DefaultValue)) {
+                return $DefaultValue
+            }
+            if (-not $Required) {
+                return ""
+            }
+            Write-Host "Value is required." -ForegroundColor Yellow
+            continue
+        }
+
+        return $input.Trim()
+    }
+}
+
+function Write-EnvFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][hashtable]$EnvMap
+    )
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($key in @("TENANT_ID", "CLIENT_ID", "NOW", "SCHEDULED_FUTURE_ACTIVATIONS", "ROLE_DURATION_HOURS", "PIM_LOG_FILE")) {
+        if ($EnvMap.ContainsKey($key)) {
+            $lines.Add("$key=$($EnvMap[$key])")
+        }
+    }
+
+    $roleIndex = 1
+    while ($true) {
+        $nameKey = "PIM_ROLE_${roleIndex}_NAME"
+        $reasonKey = "PIM_ROLE_${roleIndex}_REASON"
+        if (-not $EnvMap.ContainsKey($nameKey)) {
+            break
+        }
+
+        $lines.Add("")
+        $lines.Add("$nameKey=$($EnvMap[$nameKey])")
+        $lines.Add("$reasonKey=$($EnvMap[$reasonKey])")
+        $roleIndex++
+    }
+
+    $content = ($lines -join [Environment]::NewLine) + [Environment]::NewLine
+    Set-Content -Path $Path -Value $content
+}
+
+function Invoke-SetupWizard {
+    param([string]$ScriptDirectory, [string]$EnvPath)
+
+    $envExamplePath = Join-Path $ScriptDirectory ".env.example"
+    if (-not (Test-Path -Path $EnvPath)) {
+        if (Test-Path -Path $envExamplePath) {
+            Copy-Item -Path $envExamplePath -Destination $EnvPath
+            Write-Host "Created .env from .env.example"
+        }
+        else {
+            Set-Content -Path $EnvPath -Value "TENANT_ID=`nCLIENT_ID=`nNOW=true`nSCHEDULED_FUTURE_ACTIVATIONS=0`nROLE_DURATION_HOURS=8`nPIM_LOG_FILE=./pimelim.log`n"
+            Write-Host "Created new .env"
+        }
+    }
+    else {
+        Write-Host ".env already exists. Using existing values as defaults."
+    }
+
+    $envMap = Read-EnvFile -Path $EnvPath
+    $envMap["TENANT_ID"] = Prompt-Value -Prompt "Tenant ID" -DefaultValue (Get-ConfigValue -EnvMap $envMap -Key "TENANT_ID") -Required
+    $envMap["CLIENT_ID"] = Prompt-Value -Prompt "Client ID" -DefaultValue (Get-ConfigValue -EnvMap $envMap -Key "CLIENT_ID") -Required
+
+    if (-not $envMap.ContainsKey("NOW")) { $envMap["NOW"] = "true" }
+    if (-not $envMap.ContainsKey("SCHEDULED_FUTURE_ACTIVATIONS")) { $envMap["SCHEDULED_FUTURE_ACTIVATIONS"] = "0" }
+    if (-not $envMap.ContainsKey("ROLE_DURATION_HOURS")) { $envMap["ROLE_DURATION_HOURS"] = "8" }
+    if (-not $envMap.ContainsKey("PIM_LOG_FILE")) { $envMap["PIM_LOG_FILE"] = "./pimelim.log" }
+
+    $existingRoles = Get-RoleConfigsFromEnv -EnvMap $envMap
+    $defaultRoleCount = if ($existingRoles.Count -gt 0) { $existingRoles.Count } else { 1 }
+    $roleCountRaw = Prompt-Value -Prompt "Number of PIM roles" -DefaultValue $defaultRoleCount -Required
+    $roleCount = 1
+    if (-not [int]::TryParse($roleCountRaw, [ref]$roleCount) -or $roleCount -lt 1) {
+        throw "Number of PIM roles must be an integer >= 1"
+    }
+
+    foreach ($key in @($envMap.Keys)) {
+        if ($key -match '^PIM_ROLE_\d+_(NAME|REASON)$') {
+            $envMap.Remove($key)
+        }
+    }
+
+    for ($i = 1; $i -le $roleCount; $i++) {
+        $defaultName = if ($existingRoles.Count -ge $i) { $existingRoles[$i - 1].Name } else { "" }
+        $defaultReason = if ($existingRoles.Count -ge $i) { $existingRoles[$i - 1].Reason } else { "" }
+
+        $roleName = Prompt-Value -Prompt "Role $i name" -DefaultValue $defaultName -Required
+        $roleReason = Prompt-Value -Prompt "Role $i reason" -DefaultValue $(if ([string]::IsNullOrWhiteSpace($defaultReason)) { $roleName } else { $defaultReason }) -Required
+
+        $envMap["PIM_ROLE_${i}_NAME"] = $roleName
+        $envMap["PIM_ROLE_${i}_REASON"] = $roleReason
+    }
+
+    Write-EnvFile -Path $EnvPath -EnvMap $envMap
+    Write-Host "Saved setup to $EnvPath"
+
+    $script:Bootstrap = $true
+    Write-Host "Starting bootstrap login..."
 }
 
 function Read-EnvFile {
@@ -582,8 +712,16 @@ function Invoke-Pimelim {
     $script:LogFilePath = Resolve-PathSafe -BaseDirectory $scriptDir -PathValue $logPathValue
     $tokenCachePath = Resolve-PathSafe -BaseDirectory $scriptDir -PathValue ".token-cache.json"
 
+    $allowInteractive = $Bootstrap
+    if (-not (Test-Path -Path $tokenCachePath)) {
+        if (-not $Bootstrap) {
+            Write-Log -Message "No token cache found. Auto-enabling bootstrap device login."
+        }
+        $allowInteractive = $true
+    }
+
     Write-Log -Message "PIMELIM started. Roles=$($resolvedRoles.Count), Now=$resolvedNow, Future=$resolvedFuture, DurationHours=$resolvedDurationHours, DryRun=$DryRun"
-    $accessToken = Get-AccessToken -TenantId $resolvedTenantId -ClientId $resolvedClientId -TokenCachePath $tokenCachePath -AllowInteractive:$Bootstrap
+    $accessToken = Get-AccessToken -TenantId $resolvedTenantId -ClientId $resolvedClientId -TokenCachePath $tokenCachePath -AllowInteractive:$allowInteractive
 
     $me = Invoke-GraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/me?`$select=id,userPrincipalName" -AccessToken $accessToken
     $principalId = $me.id
@@ -648,7 +786,19 @@ function Invoke-Pimelim {
 }
 
 try {
+    $scriptDir = Split-Path -Parent $PSCommandPath
+    $envPath = Resolve-PathSafe -BaseDirectory $scriptDir -PathValue $EnvFile
+
     if ($Help) {
+        Show-PimelimHelp
+        exit 0
+    }
+
+    if ($Setup) {
+        Invoke-SetupWizard -ScriptDirectory $scriptDir -EnvPath $envPath
+    }
+
+    if ($PSBoundParameters.Count -eq 0 -and -not (Test-Path -Path $envPath)) {
         Show-PimelimHelp
         exit 0
     }

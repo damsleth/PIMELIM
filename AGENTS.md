@@ -21,6 +21,7 @@ PIMELIM automatically keeps future Azure Entra PIM role activations scheduled fo
 
 ## Parameter contract
 - Supported CLI parameters:
+	- `-Setup`
 	- `-TenantId`, `-ClientId`
 	- `-Now`
 	- `-Roles` (hashtable array and JSON string forms)
@@ -29,9 +30,11 @@ PIMELIM automatically keeps future Azure Entra PIM role activations scheduled fo
 	- `-Bootstrap`, `-DryRun`, `-Help`
 - Precedence: CLI parameters override `.env` values.
 - Role reason fallback: if role reason is missing, default reason to role name.
+- If no params are provided and `.env` is missing, print `-Help` and exit.
 
 ## Help contract
 - `-Help` must print a structured, SKILL.md-like guide suitable for both humans and agents.
+- `-Setup` must provide interactive first-run setup and trigger bootstrap login.
 - Keep sections explicit and stable: purpose, scope, parameters, behavior, requirements, examples.
 - When adding/changing parameters or behavior, update `-Help` and `README.md` in the same change.
 

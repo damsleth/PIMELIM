@@ -1,8 +1,16 @@
 # PIMELIM
+**Privileged Identity Management Easy Login Interval Maintainer**.
 
-PIM (Privileged Identity Management) activation in Azure is a pain. You have to remember to activate your eligible roles before you need them, and if you want to keep a future activation window scheduled, you have to manually create a new schedule request every time one expires.  
+PIM activation in Azure is a pain.  
+You have to remember to activate your eligible roles before you need them, and if you want to keep a future activation window scheduled, you have to manually create a new schedule request every time one expires.  
 
 PIMELIM is a PowerShell tool for unattended scheduling of Azure Entra PIM role activations (for example, `Application Administrator` and `SharePoint Administrator`) using Microsoft Graph.
+
+Quick start:
+
+```bash
+pwsh ./pimelim.ps1 -Setup
+```
 
 It is built for your exact flow:
 - one-time interactive sign-in bootstrap
@@ -37,9 +45,22 @@ It is built for your exact flow:
 
 ## Setup
 
+Recommended first run (interactive wizard):
+
+```bash
+pwsh ./pimelim.ps1 -Setup
+```
+
+`-Setup` will:
+- create `.env` from `.env.example` if needed
+- prompt for required values (`TENANT_ID`, `CLIENT_ID`, at least one role + reason)
+- run bootstrap device login
+
+If you run `pwsh ./pimelim.ps1` with no parameters and no `.env` present, PIMELIM prints `-Help` output.
+
 1. Copy `.env.example` to `.env`
 2. Fill in `TENANT_ID`, `CLIENT_ID`, role names, and reasons
-3. Bootstrap once interactively:
+3. First run will auto-bootstrap interactively if no token cache exists (or run explicitly with `-Bootstrap`):
 
 ```bash
 pwsh ./pimelim.ps1 -Bootstrap
