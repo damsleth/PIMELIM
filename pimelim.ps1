@@ -700,14 +700,14 @@ function Invoke-Pimelim {
 
     $resolvedNow = Convert-ToBoolean -Value $(if (-not [string]::IsNullOrWhiteSpace([string]$Now)) { [string]$Now } else { Get-ConfigValue -EnvMap $envMap -Key "NOW" }) -Default $true
 
-    $resolvedFuture = if ($PSBoundParameters.ContainsKey("ScheduledFutureActivations") -and $ScheduledFutureActivations -ge 0) {
+    $resolvedFuture = if ($ScheduledFutureActivations -ge 0) {
         $ScheduledFutureActivations
     }
     else {
         Convert-ToIntOrDefault -Value (Get-ConfigValueFromKeys -EnvMap $envMap -Keys @("PIM_FUTURE_WINDOWS", "SCHEDULED_FUTURE_ACTIVATIONS")) -Default 0
     }
 
-    $resolvedDurationHours = if ($PSBoundParameters.ContainsKey("RoleDurationHours") -and $RoleDurationHours -gt 0) {
+    $resolvedDurationHours = if ($RoleDurationHours -gt 0) {
         $RoleDurationHours
     }
     else {
