@@ -19,6 +19,12 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $script:LogFilePath = $null
 
+# Workaround: .NET may try IPv6 first for Microsoft endpoints; on networks with
+# split-DNS or broken IPv6 routes this causes DNS resolution and connection hangs.
+# Must be set as env var before any .NET networking is used (AppContext switch alone
+# is insufficient — it doesn't cover DNS resolution on all platforms).
+$env:DOTNET_SYSTEM_NET_DISABLEIPV6 = "1"
+
 function Show-PimelimHelp {
     @"
 # PIMELIM CLI Help
@@ -441,16 +447,16 @@ function Invoke-GraphRequest {
         try {
             if ($null -ne $Body) {
                 $json = $Body | ConvertTo-Json -Depth 10
-                return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -Body $json -ContentType "application/json"
+                return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -Body $json -ContentType "application/json" -TimeoutSec 30
             }
-            return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers
+            return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -TimeoutSec 30
         }
         catch {
             $attempt++
             $statusCode = $null
             $details = $null
-            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) { $statusCode = [int]$_.Exception.Response.StatusCode }
-            if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $details = $_.ErrorDetails.Message }
+            if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response -and $_.Exception.Response.PSObject.Properties['StatusCode']) { $statusCode = [int]$_.Exception.Response.StatusCode }
+            if ($_.PSObject.Properties['ErrorDetails'] -and $_.ErrorDetails -and $_.ErrorDetails.PSObject.Properties['Message']) { $details = $_.ErrorDetails.Message }
 
             if ($attempt -lt $maxAttempts -and (($statusCode -eq 429) -or ($statusCode -ge 500 -and $statusCode -lt 600))) {
                 $sleepSeconds = [math]::Min(30, [math]::Pow(2, $attempt))
@@ -483,7 +489,7 @@ function Request-DeviceCodeToken {
     $deviceCodeUri = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/devicecode"
     $tokenUri = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
 
-    $deviceResponse = Invoke-RestMethod -Method POST -Uri $deviceCodeUri -ContentType "application/x-www-form-urlencoded" -Body @{ client_id = $ClientId; scope = $scope }
+    $deviceResponse = Invoke-RestMethod -Method POST -Uri $deviceCodeUri -ContentType "application/x-www-form-urlencoded" -Body @{ client_id = $ClientId; scope = $scope } -TimeoutSec 30
     Write-Log -Message $deviceResponse.message
 
     $pollInterval = [int]$deviceResponse.interval
@@ -496,12 +502,12 @@ function Request-DeviceCodeToken {
                 grant_type = "urn:ietf:params:oauth:grant-type:device_code"
                 client_id = $ClientId
                 device_code = $deviceResponse.device_code
-            }
+            } -TimeoutSec 30
             Save-TokenCache -Path $TokenCachePath -TokenResponse $tokenResponse
             return $tokenResponse
         }
         catch {
-            $detail = $_.ErrorDetails.Message
+            $detail = if ($_.PSObject.Properties['ErrorDetails'] -and $_.ErrorDetails) { $_.ErrorDetails.Message } else { $null }
             if ($detail -and $detail -match "authorization_pending|slow_down") { continue }
             throw
         }
@@ -518,7 +524,7 @@ function Request-RefreshToken {
         client_id = $ClientId
         refresh_token = $RefreshToken
         scope = "https://graph.microsoft.com/.default offline_access openid profile"
-    }
+    } -TimeoutSec 30
     Save-TokenCache -Path $TokenCachePath -TokenResponse $tokenResponse
     return $tokenResponse
 }
