@@ -169,4 +169,5 @@ See `.env.example` for full template. Key settings:
 
 - `.token-cache.json` is sensitive; keep permissions tight (`chmod 600`).
 - If refresh token becomes invalid/revoked, rerun with `-Bootstrap`.
+- On macOS, unattended auth refresh failure triggers a local Notification Center alert via `osascript` when available.
 - This tool only creates `selfActivate` schedule requests; it does not grant role eligibility.

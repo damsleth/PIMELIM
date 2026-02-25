@@ -91,6 +91,7 @@ Automate Azure Entra PIM self-activation requests for configured eligible roles.
 
 Default behavior:
 - If run with no parameters and no .env exists, help is printed.
+- On macOS, unattended auth failure triggers a local notification via osascript (if available).
 
 ## Scheduling Behavior
 Per role:
@@ -148,6 +149,28 @@ function Write-Log {
     Write-Host $line
     if ($script:LogFilePath) {
         Add-Content -Path $script:LogFilePath -Value $line
+    }
+}
+
+function Send-MacNotification {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [string]$Title = "PIMELIM"
+    )
+
+    if (-not $IsMacOS) { return }
+
+    $osascript = Get-Command -Name "osascript" -ErrorAction SilentlyContinue
+    if (-not $osascript) { return }
+
+    $safeMessage = $Message.Replace('"', '\"').Replace("`n", " ").Replace("`r", " ")
+    $safeTitle = $Title.Replace('"', '\"').Replace("`n", " ").Replace("`r", " ")
+    $scriptLine = 'display notification "{0}" with title "{1}"' -f $safeMessage, $safeTitle
+
+    try {
+        & $osascript.Source -e $scriptLine | Out-Null
+    }
+    catch {
     }
 }
 
@@ -547,6 +570,9 @@ function Get-AccessToken {
             }
             catch {
                 Write-Log -Level "WARN" -Message "Refresh token flow failed: $($_.Exception.Message)"
+                if (-not $AllowInteractive) {
+                    Send-MacNotification -Message "PIMELIM auth refresh failed. Run 'pwsh ./pimelim.ps1 -Bootstrap' to re-authenticate."
+                }
             }
         }
     }

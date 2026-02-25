@@ -36,6 +36,7 @@ Notes:
 - Run bootstrap once manually before enabling unattended schedule:
   - `pwsh ./pimelim.ps1 -Bootstrap`
 - Keep `.token-cache.json` permissions restrictive.
+- On macOS, if unattended refresh-token auth fails, PIMELIM sends a local notification via `osascript` (if available).
 
 Recommended `.env` keys for unattended runs:
 - Required keys:
