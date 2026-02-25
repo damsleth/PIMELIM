@@ -16,7 +16,7 @@ It is built for your exact flow:
 - one-time interactive sign-in bootstrap
 - local token cache with refresh
 - recurring unattended runs from cron/systemd/Task Scheduler
-- optional immediate activation + configurable future back-to-back windows
+- optional immediate activation + configurable coverage horizon in hours
 
 ## How it works
 
@@ -24,10 +24,11 @@ It is built for your exact flow:
 - CLI parameters override `.env` values when provided
 - Uses delegated Graph auth via device-code on first run (`-Bootstrap`)
 - Stores refresh/access tokens in `.token-cache.json`
-- On each run, schedules per role using `Now` + `PIM_FUTURE_WINDOWS` (or CLI `-ScheduledFutureActivations`):
+- On each run, schedules per role using `Now` + `COVER_FOR_HOURS` (or CLI `-CoverForHours`):
 	- active role: starts from current active end-time
-	- inactive role + `Now=true`: schedules immediately, then future windows
-	- inactive role + `Now=false`: schedules future-only windows
+	- inactive role + `Now=true`: schedules starting immediately
+	- inactive role + `Now=false`: schedules future-only starting at now + duration
+- Number of windows is calculated as `ceil(CoverForHours / RoleDurationHours)`
 - Overlapping windows are skipped. If Graph still returns an overlap on create, it is logged and treated as skipped.
 - Logs to console + local log file
 
@@ -42,7 +43,7 @@ It is built for your exact flow:
 - Admin consent granted for required delegated permissions
 - Eligible PIM assignment for each role you want to activate
 
-> Important: strict Conditional Access / MFA policies can still block unattended renewal. PIMELIM mitigates this by pre-scheduling future windows when policy allows it.
+> Important: strict Conditional Access / MFA policies can still block unattended renewal. PIMELIM mitigates this by pre-scheduling enough windows to cover the configured horizon when policy allows it.
 
 ## Setup
 
@@ -54,7 +55,7 @@ pwsh ./pimelim.ps1 -Setup
 
 `-Setup` will:
 - create `.env` from `.env.example` if needed
-- prompt for required values (`TENANT_ID`, `CLIENT_ID`, at least one role + reason)
+- prompt for required values (`TENANT_ID`, `CLIENT_ID`, and at least one `ROLE_<N>_NAME` + `ROLE_<N>_REASON` block)
 - run bootstrap device login
 
 If you run `pwsh ./pimelim.ps1` with no parameters and no `.env` present, PIMELIM prints `-Help` output.
@@ -70,7 +71,7 @@ pwsh ./pimelim.ps1 -Bootstrap
 Or bootstrap with explicit CLI parameters:
 
 ```bash
-pwsh ./pimelim.ps1 -Bootstrap -Now $true -ScheduledFutureActivations 1 -RoleDurationHours 8 -Roles @(@{name="Application Administrator";reason="apps are great"},@{name="SharePoint Administrator"})
+pwsh ./pimelim.ps1 -Bootstrap -Now $true -CoverForHours 36 -RoleDurationHours 8 -Roles @(@{name="Application Administrator";reason="apps are great"},@{name="SharePoint Administrator"})
 ```
 
 4. Validate without writing requests:
@@ -96,19 +97,19 @@ pwsh ./pimelim.ps1 -DryRun
 PowerShell hashtable roles (recommended):
 
 ```bash
-pwsh -NoProfile -Command '& ./pimelim.ps1 -Now true -ScheduledFutureActivations 1 -RoleDurationHours 8 -Roles @(@{name="Application Administrator";reason="apps are great"},@{name="SharePoint Administrator"})'
+pwsh -NoProfile -Command '& ./pimelim.ps1 -Now true -CoverForHours 36 -RoleDurationHours 8 -Roles @(@{name="Application Administrator";reason="apps are great"},@{name="SharePoint Administrator"})'
 ```
 
 JSON roles input:
 
 ```bash
-pwsh -NoProfile -Command '& ./pimelim.ps1 -Now true -ScheduledFutureActivations 1 -RoleDurationHours 8 -Roles ''[{"name":"Application Administrator","reason":"apps are great"},{"name":"SharePoint Administrator"}]''' 
+pwsh -NoProfile -Command '& ./pimelim.ps1 -Now true -CoverForHours 36 -RoleDurationHours 8 -Roles ''[{"name":"Application Administrator","reason":"apps are great"},{"name":"SharePoint Administrator"}]''' 
 ```
 
 Future-only scheduling (no immediate activation for inactive roles):
 
 ```bash
-pwsh ./pimelim.ps1 -Now false -ScheduledFutureActivations 2
+pwsh ./pimelim.ps1 -Now false -CoverForHours 36
 ```
 
 ## Run unattended
@@ -123,7 +124,7 @@ Example systemd timer strategy (Ubuntu VPS):
 - service executes `pwsh /path/to/PIMELIM/pimelim.ps1`
 - timer runs every 30m
 
-This cadence keeps future windows topped up and resilient to transient Graph/API failures.
+This cadence keeps coverage topped up and resilient to transient Graph/API failures.
 
 ## Scheduler templates
 
@@ -138,15 +139,17 @@ See `schedulers/README.md` for setup steps.
 
 See `.env.example` for full template. Key settings:
 
-- `TENANT_ID`, `CLIENT_ID`
-- `NOW` (default `true`)
-- `PIM_FUTURE_WINDOWS` (default `0`, legacy alias: `SCHEDULED_FUTURE_ACTIVATIONS`)
-- `PIM_ACTIVATION_DURATION_HOURS` (default `8`, legacy alias: `ROLE_DURATION_HOURS`)
-- `PIM_LOG_FILE`
-- role blocks:
-	- `PIM_ROLE_1_NAME`, `PIM_ROLE_1_REASON`
-	- `PIM_ROLE_2_NAME`, `PIM_ROLE_2_REASON`
+- Required keys:
+	- `TENANT_ID`, `CLIENT_ID`
+- Required role blocks:
+	- `ROLE_1_NAME`, `ROLE_1_REASON`
+	- `ROLE_2_NAME`, `ROLE_2_REASON`
 	- and so on
+- Optional keys:
+	- `NOW` (default `true`)
+	- `COVER_FOR_HOURS` (default `36`)
+	- `ACTIVATION_DURATION_HOURS` (default `8`)
+	- `LOG_FILE` (default `./pimelim.log`)
 
 ## CLI Parameters
 
@@ -154,7 +157,7 @@ See `.env.example` for full template. Key settings:
 - `-ClientId <string>`
 - `-Now <bool>`
 - `-Roles <object[]>` (hashtable array or JSON string)
-- `-ScheduledFutureActivations <int>`
+- `-CoverForHours <int>`
 - `-RoleDurationHours <int>`
 - `-Bootstrap`
 - `-DryRun`

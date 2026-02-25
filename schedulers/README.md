@@ -36,3 +36,16 @@ Notes:
 - Run bootstrap once manually before enabling unattended schedule:
   - `pwsh ./pimelim.ps1 -Bootstrap`
 - Keep `.token-cache.json` permissions restrictive.
+
+Recommended `.env` keys for unattended runs:
+- Required keys:
+   - `TENANT_ID=...`
+   - `CLIENT_ID=...`
+- Required role blocks (at least one):
+   - `ROLE_1_NAME=Application Administrator`
+   - `ROLE_1_REASON=Your reason`
+- Optional keys:
+   - `NOW=true` (default: true)
+   - `COVER_FOR_HOURS=36` (default: 36)
+   - `ACTIVATION_DURATION_HOURS=8` (default: 8)
+   - `LOG_FILE=./pimelim.log` (default: `./pimelim.log`)

@@ -8,7 +8,7 @@ param(
     [string]$ClientId,
     [string]$Now,
     [object[]]$Roles,
-    [int]$ScheduledFutureActivations = -1,
+    [int]$CoverForHours = -1,
     [int]$RoleDurationHours = -1,
     [switch]$Bootstrap,
     [switch]$DryRun,
@@ -67,17 +67,17 @@ Automate Azure Entra PIM self-activation requests for configured eligible roles.
   Required field: name
   Optional field: reason
   If reason is missing/blank, reason defaults to name.
-  Fallback: PIM_ROLE_<N>_NAME and PIM_ROLE_<N>_REASON in .env
+    Fallback: ROLE_<N>_NAME and ROLE_<N>_REASON in .env
 
--ScheduledFutureActivations <int>
-  Number of future back-to-back windows to schedule.
-  Default: 0
-  Fallback: PIM_FUTURE_WINDOWS or SCHEDULED_FUTURE_ACTIVATIONS in .env
+-CoverForHours <int>
+    Target coverage horizon from scheduling anchor (hours).
+    Default: 36
+    Fallback: COVER_FOR_HOURS in .env
 
 -RoleDurationHours <int>
   Activation duration (hours).
   Default: 8
-  Fallback: PIM_ACTIVATION_DURATION_HOURS or ROLE_DURATION_HOURS in .env
+        Fallback: ACTIVATION_DURATION_HOURS in .env
 
 -Bootstrap
     Forces interactive device-code login if needed.
@@ -96,12 +96,12 @@ Default behavior:
 Per role:
 - If role is currently active: schedule from active end-time.
 - If role is inactive and Now=true: schedule from now.
-- If role is inactive and Now=false: schedule only future windows from now + duration.
+- If role is inactive and Now=false: schedule from now + duration (future-only).
 
-Window count:
-- Active role: ScheduledFutureActivations windows.
-- Inactive role + Now=true: 1 immediate + ScheduledFutureActivations future windows.
-- Inactive role + Now=false: ScheduledFutureActivations future windows.
+Coverage model:
+- Windows are back-to-back with length RoleDurationHours.
+- Number of windows = ceil(CoverForHours / RoleDurationHours).
+- CoverForHours=0 schedules no windows.
 
 Overlap safety:
 - Candidate windows that overlap existing non-failed requests are skipped.
@@ -127,13 +127,13 @@ pwsh ./pimelim.ps1
 pwsh ./pimelim.ps1 -DryRun
 
 # Dry-run with explicit hashtable roles
-pwsh ./pimelim.ps1 -DryRun -TenantId "<tenant>" -ClientId "<client>" -Now $true -ScheduledFutureActivations 1 -RoleDurationHours 8 -Roles @(@{name="Application Administrator"}, @{name="SharePoint Administrator";reason="SharePoint ops"})
+pwsh ./pimelim.ps1 -DryRun -TenantId "<tenant>" -ClientId "<client>" -Now $true -CoverForHours 36 -RoleDurationHours 8 -Roles @(@{name="Application Administrator"}, @{name="SharePoint Administrator";reason="SharePoint ops"})
 
 # Dry-run with JSON roles
-pwsh ./pimelim.ps1 -DryRun -Now true -ScheduledFutureActivations 1 -Roles '[{"name":"Application Administrator"},{"name":"SharePoint Administrator","reason":"SharePoint ops"}]'
+pwsh ./pimelim.ps1 -DryRun -Now true -CoverForHours 36 -Roles '[{"name":"Application Administrator"},{"name":"SharePoint Administrator","reason":"SharePoint ops"}]'
 
 # Future-only scheduling (inactive roles are not activated immediately)
-pwsh ./pimelim.ps1 -Now false -ScheduledFutureActivations 2
+pwsh ./pimelim.ps1 -Now false -CoverForHours 36
 "@
 }
 
@@ -190,7 +190,7 @@ function Write-EnvFile {
     )
 
     $lines = [System.Collections.Generic.List[string]]::new()
-    foreach ($key in @("TENANT_ID", "CLIENT_ID", "NOW", "PIM_FUTURE_WINDOWS", "PIM_ACTIVATION_DURATION_HOURS", "PIM_LOG_FILE")) {
+    foreach ($key in @("TENANT_ID", "CLIENT_ID", "NOW", "COVER_FOR_HOURS", "ACTIVATION_DURATION_HOURS", "LOG_FILE")) {
         if ($EnvMap.ContainsKey($key)) {
             $lines.Add("$key=$($EnvMap[$key])")
         }
@@ -198,8 +198,8 @@ function Write-EnvFile {
 
     $roleIndex = 1
     while ($true) {
-        $nameKey = "PIM_ROLE_${roleIndex}_NAME"
-        $reasonKey = "PIM_ROLE_${roleIndex}_REASON"
+        $nameKey = "ROLE_${roleIndex}_NAME"
+        $reasonKey = "ROLE_${roleIndex}_REASON"
         if (-not $EnvMap.ContainsKey($nameKey)) {
             break
         }
@@ -224,7 +224,7 @@ function Invoke-SetupWizard {
             Write-Host "Created .env from .env.example"
         }
         else {
-            Set-Content -Path $EnvPath -Value "TENANT_ID=`nCLIENT_ID=`nNOW=true`nPIM_FUTURE_WINDOWS=0`nPIM_ACTIVATION_DURATION_HOURS=8`nPIM_LOG_FILE=./pimelim.log`n"
+            Set-Content -Path $EnvPath -Value "TENANT_ID=`nCLIENT_ID=`nNOW=true`nCOVER_FOR_HOURS=36`nACTIVATION_DURATION_HOURS=8`nLOG_FILE=./pimelim.log`n"
             Write-Host "Created new .env"
         }
     }
@@ -237,13 +237,11 @@ function Invoke-SetupWizard {
     $envMap["CLIENT_ID"] = Prompt-Value -Prompt "Client ID" -DefaultValue (Get-ConfigValue -EnvMap $envMap -Key "CLIENT_ID") -Required
 
     if (-not $envMap.ContainsKey("NOW")) { $envMap["NOW"] = "true" }
-    if (-not $envMap.ContainsKey("PIM_FUTURE_WINDOWS")) {
-        $envMap["PIM_FUTURE_WINDOWS"] = Get-ConfigValueFromKeys -EnvMap $envMap -Keys @("SCHEDULED_FUTURE_ACTIVATIONS") -Default "0"
+    if (-not $envMap.ContainsKey("COVER_FOR_HOURS")) { $envMap["COVER_FOR_HOURS"] = "36" }
+    if (-not $envMap.ContainsKey("ACTIVATION_DURATION_HOURS")) {
+        $envMap["ACTIVATION_DURATION_HOURS"] = "8"
     }
-    if (-not $envMap.ContainsKey("PIM_ACTIVATION_DURATION_HOURS")) {
-        $envMap["PIM_ACTIVATION_DURATION_HOURS"] = Get-ConfigValueFromKeys -EnvMap $envMap -Keys @("ROLE_DURATION_HOURS") -Default "8"
-    }
-    if (-not $envMap.ContainsKey("PIM_LOG_FILE")) { $envMap["PIM_LOG_FILE"] = "./pimelim.log" }
+    if (-not $envMap.ContainsKey("LOG_FILE")) { $envMap["LOG_FILE"] = "./pimelim.log" }
 
     $existingRoles = Get-RoleConfigsFromEnv -EnvMap $envMap
     $defaultRoleCount = if ($existingRoles.Count -gt 0) { $existingRoles.Count } else { 1 }
@@ -254,7 +252,7 @@ function Invoke-SetupWizard {
     }
 
     foreach ($key in @($envMap.Keys)) {
-        if ($key -match '^PIM_ROLE_\d+_(NAME|REASON)$') {
+        if ($key -match '^ROLE_\d+_(NAME|REASON)$') {
             $envMap.Remove($key)
         }
     }
@@ -266,8 +264,8 @@ function Invoke-SetupWizard {
         $roleName = Prompt-Value -Prompt "Role $i name" -DefaultValue $defaultName -Required
         $roleReason = Prompt-Value -Prompt "Role $i reason" -DefaultValue $(if ([string]::IsNullOrWhiteSpace($defaultReason)) { $roleName } else { $defaultReason }) -Required
 
-        $envMap["PIM_ROLE_${i}_NAME"] = $roleName
-        $envMap["PIM_ROLE_${i}_REASON"] = $roleReason
+        $envMap["ROLE_${i}_NAME"] = $roleName
+        $envMap["ROLE_${i}_REASON"] = $roleReason
     }
 
     Write-EnvFile -Path $EnvPath -EnvMap $envMap
@@ -417,8 +415,8 @@ function Get-RoleConfigsFromEnv {
     $roles = @()
     $index = 1
     while ($true) {
-        $nameKey = "PIM_ROLE_${index}_NAME"
-        $reasonKey = "PIM_ROLE_${index}_REASON"
+        $nameKey = "ROLE_${index}_NAME"
+        $reasonKey = "ROLE_${index}_REASON"
         if (-not $EnvMap.ContainsKey($nameKey) -or [string]::IsNullOrWhiteSpace($EnvMap[$nameKey])) { break }
 
         $name = $EnvMap[$nameKey].Trim()
@@ -565,6 +563,12 @@ function Get-DesiredStartTimesFromAnchorUtc {
     return $starts
 }
 
+function Get-WindowCountForCoverage {
+    param([int]$CoverForHours, [int]$DurationHours)
+    if ($CoverForHours -le 0) { return 0 }
+    return [int][Math]::Ceiling($CoverForHours / [double]$DurationHours)
+}
+
 function Format-GraphDateTime {
     param([datetime]$DateValue)
     return $DateValue.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -706,22 +710,22 @@ function Invoke-Pimelim {
 
     $resolvedNow = Convert-ToBoolean -Value $(if (-not [string]::IsNullOrWhiteSpace([string]$Now)) { [string]$Now } else { Get-ConfigValue -EnvMap $envMap -Key "NOW" }) -Default $true
 
-    $resolvedFuture = if ($ScheduledFutureActivations -ge 0) {
-        $ScheduledFutureActivations
+    $resolvedCoverForHours = if ($CoverForHours -ge 0) {
+        $CoverForHours
     }
     else {
-        Convert-ToIntOrDefault -Value (Get-ConfigValueFromKeys -EnvMap $envMap -Keys @("PIM_FUTURE_WINDOWS", "SCHEDULED_FUTURE_ACTIVATIONS")) -Default 0
+        Convert-ToIntOrDefault -Value (Get-ConfigValue -EnvMap $envMap -Key "COVER_FOR_HOURS") -Default 36
     }
 
     $resolvedDurationHours = if ($RoleDurationHours -gt 0) {
         $RoleDurationHours
     }
     else {
-        Convert-ToIntOrDefault -Value (Get-ConfigValueFromKeys -EnvMap $envMap -Keys @("PIM_ACTIVATION_DURATION_HOURS", "ROLE_DURATION_HOURS")) -Default 8
+        Convert-ToIntOrDefault -Value (Get-ConfigValue -EnvMap $envMap -Key "ACTIVATION_DURATION_HOURS") -Default 8
     }
 
-    if ($resolvedFuture -lt 0 -or $resolvedDurationHours -le 0) {
-        throw "ScheduledFutureActivations must be >= 0 and RoleDurationHours must be > 0."
+    if ($resolvedCoverForHours -lt 0 -or $resolvedDurationHours -le 0) {
+        throw "CoverForHours must be >= 0 and RoleDurationHours must be > 0."
     }
 
     $resolvedRoles = if ($null -ne $Roles -and @($Roles).Count -gt 0) {
@@ -732,10 +736,10 @@ function Invoke-Pimelim {
     }
 
     if (-not $resolvedRoles -or $resolvedRoles.Count -eq 0) {
-        throw "No roles configured. Provide -Roles or PIM_ROLE_<N>_NAME in $envPath"
+        throw "No roles configured. Provide -Roles or ROLE_<N>_NAME in $envPath"
     }
 
-    $logPathValue = Get-ConfigValue -EnvMap $envMap -Key "PIM_LOG_FILE" -Default "./pimelim.log"
+    $logPathValue = Get-ConfigValue -EnvMap $envMap -Key "LOG_FILE" -Default "./pimelim.log"
     $script:LogFilePath = Resolve-PathSafe -BaseDirectory $scriptDir -PathValue $logPathValue
     $tokenCachePath = Resolve-PathSafe -BaseDirectory $scriptDir -PathValue ".token-cache.json"
 
@@ -747,7 +751,7 @@ function Invoke-Pimelim {
         $allowInteractive = $true
     }
 
-    Write-Log -Message "PIMELIM started. Roles=$($resolvedRoles.Count), Now=$resolvedNow, Future=$resolvedFuture, DurationHours=$resolvedDurationHours, DryRun=$DryRun"
+    Write-Log -Message "PIMELIM started. Roles=$($resolvedRoles.Count), Now=$resolvedNow, CoverForHours=$resolvedCoverForHours, DurationHours=$resolvedDurationHours, DryRun=$DryRun"
     $accessToken = Get-AccessToken -TenantId $resolvedTenantId -ClientId $resolvedClientId -TokenCachePath $tokenCachePath -AllowInteractive:$allowInteractive
 
     $me = Invoke-GraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/me?`$select=id,userPrincipalName" -AccessToken $accessToken
@@ -763,18 +767,19 @@ function Invoke-Pimelim {
 
         $desiredStartsUtc = @()
         if ($activeEndUtc) {
-            $desiredStartsUtc = @(Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $activeEndUtc -DurationHours $resolvedDurationHours -WindowCount $resolvedFuture)
-            Write-Log -Message "Role '$($role.Name)' is active until $(Format-GraphDateTime -DateValue $activeEndUtc). Scheduling $resolvedFuture future window(s)."
+            $windowCount = Get-WindowCountForCoverage -CoverForHours $resolvedCoverForHours -DurationHours $resolvedDurationHours
+            $desiredStartsUtc = @(Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $activeEndUtc -DurationHours $resolvedDurationHours -WindowCount $windowCount)
+            Write-Log -Message "Role '$($role.Name)' is active until $(Format-GraphDateTime -DateValue $activeEndUtc). Coverage target=$resolvedCoverForHours hour(s), windows=$windowCount."
         }
         else {
-            $windowCount = if ($resolvedNow) { $resolvedFuture + 1 } else { $resolvedFuture }
+            $anchor = if ($resolvedNow) { $roleNowUtc } else { $roleNowUtc.AddHours($resolvedDurationHours) }
+            $windowCount = Get-WindowCountForCoverage -CoverForHours $resolvedCoverForHours -DurationHours $resolvedDurationHours
             if ($windowCount -gt 0) {
-                $anchor = if ($resolvedNow) { $roleNowUtc } else { $roleNowUtc.AddHours($resolvedDurationHours) }
                 $desiredStartsUtc = @(Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $anchor -DurationHours $resolvedDurationHours -WindowCount $windowCount)
-                Write-Log -Message "Role '$($role.Name)' is inactive. Scheduling $windowCount window(s) from $(Format-GraphDateTime -DateValue $anchor)."
+                Write-Log -Message "Role '$($role.Name)' is inactive. Scheduling $windowCount window(s) from $(Format-GraphDateTime -DateValue $anchor) to cover $resolvedCoverForHours hour(s)."
             }
             else {
-                Write-Log -Message "Role '$($role.Name)' is inactive. No activation requested (Now=false and ScheduledFutureActivations=0)."
+                Write-Log -Message "Role '$($role.Name)' is inactive. No activation requested (CoverForHours=0)."
             }
         }
 
