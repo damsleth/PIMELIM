@@ -582,6 +582,11 @@ function Get-AccessToken {
     return (Request-DeviceCodeToken -TenantId $TenantId -ClientId $ClientId -TokenCachePath $TokenCachePath).access_token
 }
 
+function Truncate-ToUtcSecond {
+    param([datetime]$DateValue)
+    return [datetime]::new($DateValue.Year, $DateValue.Month, $DateValue.Day, $DateValue.Hour, $DateValue.Minute, $DateValue.Second, [DateTimeKind]::Utc)
+}
+
 function Get-DesiredStartTimesFromAnchorUtc {
     param([datetime]$FirstStartUtc, [int]$DurationHours, [int]$WindowCount)
     $starts = @()
@@ -644,13 +649,14 @@ function Get-ExistingScheduledIntervals {
         foreach ($item in $response.value) {
             $status = [string]$item.status
             if ($status -match 'Denied|Failed|Canceled|Revoked') { continue }
-            if ($item.action -and [string]$item.action -ne 'selfActivate') { continue }
+            if ([string]$item.action -ne 'selfActivate') { continue }
 
             if ($item.scheduleInfo -and $item.scheduleInfo.startDateTime) {
-                $startUtc = Convert-ToUtcDateTime -Value $item.scheduleInfo.startDateTime
+                # Truncate to whole seconds so interval boundaries align with PIMELIM-created schedule times
+                $startUtc = Truncate-ToUtcSecond -DateValue (Convert-ToUtcDateTime -Value $item.scheduleInfo.startDateTime)
                 $endUtc = Try-GetEndTimeFromScheduleInfo -ScheduleInfo $item.scheduleInfo -StartUtc $startUtc
                 if ($endUtc -and $endUtc -gt $startUtc) {
-                    $intervals += [PSCustomObject]@{ StartUtc = $startUtc; EndUtc = $endUtc }
+                    $intervals += [PSCustomObject]@{ StartUtc = $startUtc; EndUtc = (Truncate-ToUtcSecond -DateValue $endUtc) }
                 }
             }
         }
@@ -682,7 +688,9 @@ function Get-ActiveRoleAssignmentEndUtc {
             $endUtc = Convert-ToUtcDateTime -Value $item.endDateTime
 
             if ($startUtc -le $NowUtc -and $endUtc -gt $NowUtc) {
-                if (-not $activeEnd -or $endUtc -gt $activeEnd) { $activeEnd = $endUtc }
+                # Truncate to whole seconds so the scheduling anchor aligns with PIMELIM-created windows
+                $endUtcTruncated = Truncate-ToUtcSecond -DateValue $endUtc
+                if (-not $activeEnd -or $endUtcTruncated -gt $activeEnd) { $activeEnd = $endUtcTruncated }
             }
         }
         $uri = Get-GraphNextLink -Response $response
