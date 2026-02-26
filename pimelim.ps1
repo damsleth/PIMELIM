@@ -79,6 +79,11 @@ Automate Azure Entra PIM self-activation requests for configured eligible roles.
   Default: 8
         Fallback: ACTIVATION_DURATION_HOURS in .env
 
+ACTIVATION_TIME_BUFFER <int> (env only)
+  Seconds added between consecutive scheduled windows to avoid Graph overlap errors.
+  Default: 60
+  Fallback: ACTIVATION_TIME_BUFFER in .env
+
 -Bootstrap
     Forces interactive device-code login if needed.
     If token cache is missing, bootstrap is auto-enabled even without this switch.
@@ -213,7 +218,7 @@ function Write-EnvFile {
     )
 
     $lines = [System.Collections.Generic.List[string]]::new()
-    foreach ($key in @("TENANT_ID", "CLIENT_ID", "NOW", "COVER_FOR_HOURS", "ACTIVATION_DURATION_HOURS", "LOG_FILE")) {
+    foreach ($key in @("TENANT_ID", "CLIENT_ID", "NOW", "COVER_FOR_HOURS", "ACTIVATION_DURATION_HOURS", "ACTIVATION_TIME_BUFFER", "LOG_FILE")) {
         if ($EnvMap.ContainsKey($key)) {
             $lines.Add("$key=$($EnvMap[$key])")
         }
@@ -588,9 +593,9 @@ function Truncate-ToUtcSecond {
 }
 
 function Get-DesiredStartTimesFromAnchorUtc {
-    param([datetime]$FirstStartUtc, [int]$DurationHours, [int]$WindowCount)
+    param([datetime]$FirstStartUtc, [int]$DurationHours, [int]$WindowCount, [int]$BufferSeconds = 0)
     $starts = @()
-    for ($i = 0; $i -lt $WindowCount; $i++) { $starts += $FirstStartUtc.AddHours($i * $DurationHours) }
+    for ($i = 0; $i -lt $WindowCount; $i++) { $starts += $FirstStartUtc.AddHours($i * $DurationHours).AddSeconds($i * $BufferSeconds) }
     return $starts
 }
 
@@ -758,6 +763,8 @@ function Invoke-Pimelim {
         Convert-ToIntOrDefault -Value (Get-ConfigValue -EnvMap $envMap -Key "ACTIVATION_DURATION_HOURS") -Default 8
     }
 
+    $resolvedBufferSeconds = Convert-ToIntOrDefault -Value (Get-ConfigValue -EnvMap $envMap -Key "ACTIVATION_TIME_BUFFER") -Default 60
+
     if ($resolvedCoverForHours -lt 0 -or $resolvedDurationHours -le 0) {
         throw "CoverForHours must be >= 0 and RoleDurationHours must be > 0."
     }
@@ -785,7 +792,7 @@ function Invoke-Pimelim {
         $allowInteractive = $true
     }
 
-    Write-Log -Message "PIMELIM started. Roles=$($resolvedRoles.Count), Now=$resolvedNow, CoverForHours=$resolvedCoverForHours, DurationHours=$resolvedDurationHours, DryRun=$DryRun"
+    Write-Log -Message "PIMELIM started. Roles=$($resolvedRoles.Count), Now=$resolvedNow, CoverForHours=$resolvedCoverForHours, DurationHours=$resolvedDurationHours, BufferSeconds=$resolvedBufferSeconds, DryRun=$DryRun"
     $accessToken = Get-AccessToken -TenantId $resolvedTenantId -ClientId $resolvedClientId -TokenCachePath $tokenCachePath -AllowInteractive:$allowInteractive
 
     $me = Invoke-GraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/me?`$select=id,userPrincipalName" -AccessToken $accessToken
@@ -802,14 +809,14 @@ function Invoke-Pimelim {
         $desiredStartsUtc = @()
         if ($activeEndUtc) {
             $windowCount = Get-WindowCountForCoverage -CoverForHours $resolvedCoverForHours -DurationHours $resolvedDurationHours
-            $desiredStartsUtc = @(Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $activeEndUtc -DurationHours $resolvedDurationHours -WindowCount $windowCount)
+            $desiredStartsUtc = @(Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $activeEndUtc -DurationHours $resolvedDurationHours -WindowCount $windowCount -BufferSeconds $resolvedBufferSeconds)
             Write-Log -Message "Role '$($role.Name)' is active until $(Format-GraphDateTime -DateValue $activeEndUtc). Coverage target=$resolvedCoverForHours hour(s), windows=$windowCount."
         }
         else {
             $anchor = if ($resolvedNow) { $roleNowUtc } else { $roleNowUtc.AddHours($resolvedDurationHours) }
             $windowCount = Get-WindowCountForCoverage -CoverForHours $resolvedCoverForHours -DurationHours $resolvedDurationHours
             if ($windowCount -gt 0) {
-                $desiredStartsUtc = @(Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $anchor -DurationHours $resolvedDurationHours -WindowCount $windowCount)
+                $desiredStartsUtc = @(Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $anchor -DurationHours $resolvedDurationHours -WindowCount $windowCount -BufferSeconds $resolvedBufferSeconds)
                 Write-Log -Message "Role '$($role.Name)' is inactive. Scheduling $windowCount window(s) from $(Format-GraphDateTime -DateValue $anchor) to cover $resolvedCoverForHours hour(s)."
             }
             else {
