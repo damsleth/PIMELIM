@@ -149,6 +149,7 @@ See `.env.example` for full template. Key settings:
 	- `NOW` (default `true`)
 	- `COVER_FOR_HOURS` (default `36`)
 	- `ACTIVATION_DURATION_HOURS` (default `8`)
+	- `ACTIVATION_TIME_BUFFER` (default `60`) — seconds added between consecutive scheduled windows to prevent Graph overlap errors
 	- `LOG_FILE` (default `./pimelim.log`)
 
 ## CLI Parameters
