@@ -650,6 +650,7 @@ function Try-GetEndTimeFromScheduleInfo {
 function Get-ExistingScheduledIntervals {
     param([string]$PrincipalId, [string]$RoleDefinitionId, [string]$AccessToken)
 
+    $nowUtc = (Get-Date).ToUniversalTime()
     $filter = "principalId eq '$PrincipalId' and roleDefinitionId eq '$RoleDefinitionId'"
     $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests?`$filter=$([uri]::EscapeDataString($filter))"
     $intervals = @()
@@ -664,6 +665,10 @@ function Get-ExistingScheduledIntervals {
             if ($item.scheduleInfo -and $item.scheduleInfo.startDateTime) {
                 # Truncate to whole seconds so interval boundaries align with PIMELIM-created schedule times
                 $startUtc = Truncate-ToUtcSecond -DateValue (Convert-ToUtcDateTime -Value $item.scheduleInfo.startDateTime)
+                # Only include future-starting requests. Past-started windows are authoritative via
+                # the instances API (Get-ActiveRoleAssignmentEndUtc). A past-started request with no
+                # corresponding instance is a failed/stuck activation and must not block new scheduling.
+                if ($startUtc -le $nowUtc) { continue }
                 $endUtc = Try-GetEndTimeFromScheduleInfo -ScheduleInfo $item.scheduleInfo -StartUtc $startUtc
                 if ($endUtc -and $endUtc -gt $startUtc) {
                     $intervals += [PSCustomObject]@{ StartUtc = $startUtc; EndUtc = (Truncate-ToUtcSecond -DateValue $endUtc) }
