@@ -112,6 +112,25 @@ Future-only scheduling (no immediate activation for inactive roles):
 pwsh ./pimelim.ps1 -Now false -CoverForHours 36
 ```
 
+## Install to PATH (macOS/Linux)
+
+`pimelim.zsh` is a thin shell wrapper that forwards all arguments to `pimelim.ps1`. To run `pimelim` from anywhere:
+
+```bash
+cp pimelim.zsh /usr/local/bin/pimelim
+chmod +x /usr/local/bin/pimelim
+```
+
+The wrapper hardcodes the path to `pimelim.ps1`, so the repo must stay at `~/Code/PIMELIM/`. If you move the repo, update the path in `pimelim.zsh` and re-copy.
+
+Once installed:
+
+```bash
+pimelim --status
+pimelim -DryRun
+pimelim -Bootstrap
+```
+
 ## Run unattended
 
 Example cron entry (every 30 minutes):
