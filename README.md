@@ -162,7 +162,10 @@ See `.env.example` for full template. Key settings:
 - `-RoleDurationHours <int>`
 - `-Bootstrap`
 - `-DryRun`
+- `-Status`
 - `-Help`
+
+`-Status` prints a console table of currently active and upcoming scheduled PIM role activations, including start/end times and remaining duration per window.
 
 `-Help` prints a structured guide intended for both human and AI-agent readability.
 

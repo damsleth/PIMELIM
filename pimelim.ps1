@@ -12,6 +12,7 @@ param(
     [int]$RoleDurationHours = -1,
     [switch]$Bootstrap,
     [switch]$DryRun,
+    [switch]$Status,
     [Alias("h")][switch]$Help
 )
 
@@ -90,6 +91,10 @@ ACTIVATION_TIME_BUFFER <int> (env only)
 
 -DryRun
   Logs planned requests without creating schedule requests.
+
+-Status
+  Print a table of currently active and scheduled PIM role activations.
+  Requires an existing token cache (run -Bootstrap first if needed).
 
 -Help
   Prints this guide.
@@ -735,6 +740,142 @@ function Test-IsOverlapRequestError {
     return $ErrorMessage -match "OverlapsPendingRoleAssignmentRequests|overlaps existing role assignment requests"
 }
 
+function Get-TenantDisplayName {
+    param([string]$AccessToken)
+    $response = Invoke-GraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/organization?`$select=displayName,id" -AccessToken $AccessToken
+    if ($response.value -and $response.value.Count -gt 0) {
+        return [PSCustomObject]@{ DisplayName = $response.value[0].displayName; Id = $response.value[0].id }
+    }
+    return [PSCustomObject]@{ DisplayName = ""; Id = "" }
+}
+
+function Get-AllRoleScheduleInstances {
+    param([string]$PrincipalId, [string]$RoleDefinitionId, [string]$AccessToken)
+
+    $nowUtc = (Get-Date).ToUniversalTime()
+    $filter = "principalId eq '$PrincipalId' and roleDefinitionId eq '$RoleDefinitionId'"
+    $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleInstances?`$filter=$([uri]::EscapeDataString($filter))"
+    $instances = @()
+
+    while ($uri) {
+        $response = Invoke-GraphRequest -Method GET -Uri $uri -AccessToken $AccessToken
+        foreach ($item in $response.value) {
+            if (-not $item.startDateTime -or -not $item.endDateTime) { continue }
+            $startUtc = Convert-ToUtcDateTime -Value $item.startDateTime
+            $endUtc = Convert-ToUtcDateTime -Value $item.endDateTime
+            if ($endUtc -le $nowUtc) { continue }
+            $instances += [PSCustomObject]@{ StartUtc = $startUtc; EndUtc = $endUtc }
+        }
+        $uri = Get-GraphNextLink -Response $response
+    }
+
+    return $instances | Sort-Object StartUtc
+}
+
+function Format-RemainingTime {
+    param([TimeSpan]$Span, [bool]$IsFuture)
+    $totalMinutes = [int]$Span.TotalMinutes
+    if ($totalMinutes -lt 1) { return if ($IsFuture) { "in <1m" } else { "<1m" } }
+    $h = [int][Math]::Floor($Span.TotalHours)
+    $m = $Span.Minutes
+    $formatted = if ($h -gt 0) { "${h}h ${m}m" } else { "${m}m" }
+    return if ($IsFuture) { "in $formatted" } else { $formatted }
+}
+
+function Show-PimelimStatus {
+    $scriptDir = Split-Path -Parent $PSCommandPath
+    $envPath = Resolve-PathSafe -BaseDirectory $scriptDir -PathValue $EnvFile
+    $envMap = Read-EnvFile -Path $envPath
+
+    $resolvedTenantId = if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $TenantId } else { Get-ConfigValue -EnvMap $envMap -Key "TENANT_ID" }
+    $resolvedClientId = if (-not [string]::IsNullOrWhiteSpace($ClientId)) { $ClientId } else { Get-ConfigValue -EnvMap $envMap -Key "CLIENT_ID" }
+
+    if ([string]::IsNullOrWhiteSpace($resolvedTenantId) -or [string]::IsNullOrWhiteSpace($resolvedClientId)) {
+        throw "TenantId/ClientId are required. Provide CLI values or TENANT_ID/CLIENT_ID in $envPath"
+    }
+
+    $resolvedRoles = if ($null -ne $Roles -and @($Roles).Count -gt 0) {
+        Resolve-RoleObjectsFromInput -RolesInput $Roles
+    }
+    else {
+        Get-RoleConfigsFromEnv -EnvMap $envMap
+    }
+
+    if (-not $resolvedRoles -or $resolvedRoles.Count -eq 0) {
+        throw "No roles configured. Provide -Roles or ROLE_<N>_NAME in $envPath"
+    }
+
+    $tokenCachePath = Resolve-PathSafe -BaseDirectory $scriptDir -PathValue ".token-cache.json"
+    $accessToken = Get-AccessToken -TenantId $resolvedTenantId -ClientId $resolvedClientId -TokenCachePath $tokenCachePath
+
+    $tenant = Get-TenantDisplayName -AccessToken $accessToken
+    $me = Invoke-GraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/me?`$select=id,userPrincipalName" -AccessToken $accessToken
+    $principalId = $me.id
+
+    $nowUtc = (Get-Date).ToUniversalTime()
+    $rows = @()
+
+    foreach ($role in $resolvedRoles) {
+        $roleDef = $null
+        try {
+            $roleDef = Get-RoleDefinitionByName -RoleName $role.Name -AccessToken $accessToken
+        }
+        catch {
+            Write-Log -Level "WARN" -Message "Role '$($role.Name)' not found: $($_.Exception.Message)"
+            $rows += [PSCustomObject]@{ Role = $role.Name; Status = "INACTIVE"; StartUtc = $null; EndUtc = $null }
+            continue
+        }
+
+        $instances = @(Get-AllRoleScheduleInstances -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken)
+
+        if ($instances.Count -eq 0) {
+            $rows += [PSCustomObject]@{ Role = $role.Name; Status = "INACTIVE"; StartUtc = $null; EndUtc = $null }
+        }
+        else {
+            foreach ($inst in $instances) {
+                $status = if ($inst.StartUtc -le $nowUtc) { "ACTIVE" } else { "SCHEDULED" }
+                $rows += [PSCustomObject]@{ Role = $role.Name; Status = $status; StartUtc = $inst.StartUtc; EndUtc = $inst.EndUtc }
+            }
+        }
+    }
+
+    $tenantDisplay = if (-not [string]::IsNullOrWhiteSpace($tenant.DisplayName)) { $tenant.DisplayName } else { $resolvedTenantId }
+    $tenantId = if (-not [string]::IsNullOrWhiteSpace($tenant.Id)) { $tenant.Id } else { $resolvedTenantId }
+
+    Write-Host ""
+    Write-Host "Tenant   : $tenantDisplay"
+    Write-Host "Tenant ID: $tenantId"
+    Write-Host ""
+
+    $colRole = 30
+    $colStatus = 9
+    $colDt = 20
+
+    $header  = "{0,-$colRole}  {1,-$colStatus}  {2,-$colDt}  {3,-$colDt}  {4}" -f "Role", "Status", "Start (UTC)", "End (UTC)", "Remaining"
+    $divider = "{0}  {1}  {2}  {3}  {4}" -f ("-" * $colRole), ("-" * $colStatus), ("-" * $colDt), ("-" * $colDt), ("-" * 9)
+    Write-Host $header
+    Write-Host $divider
+
+    foreach ($row in $rows) {
+        $startStr = if ($row.StartUtc) { $row.StartUtc.ToString("yyyy-MM-dd HH:mm:ss") } else { "-" }
+        $endStr   = if ($row.EndUtc)   { $row.EndUtc.ToString("yyyy-MM-dd HH:mm:ss")   } else { "-" }
+
+        $remaining = "-"
+        if ($row.Status -eq "ACTIVE" -and $row.EndUtc) {
+            $span = $row.EndUtc - $nowUtc
+            $remaining = Format-RemainingTime -Span $span -IsFuture $false
+        }
+        elseif ($row.Status -eq "SCHEDULED" -and $row.StartUtc) {
+            $span = $row.StartUtc - $nowUtc
+            $remaining = Format-RemainingTime -Span $span -IsFuture $true
+        }
+
+        Write-Host ("{0,-$colRole}  {1,-$colStatus}  {2,-$colDt}  {3,-$colDt}  {4}" -f $row.Role, $row.Status, $startStr, $endStr, $remaining)
+    }
+
+    Write-Host ""
+}
+
 function Invoke-Pimelim {
     $scriptDir = Split-Path -Parent $PSCommandPath
     $envPath = Resolve-PathSafe -BaseDirectory $scriptDir -PathValue $EnvFile
@@ -880,6 +1021,11 @@ try {
 
     if ($PSBoundParameters.Count -eq 0 -and -not (Test-Path -Path $envPath)) {
         Show-PimelimHelp
+        exit 0
+    }
+
+    if ($Status) {
+        Show-PimelimStatus
         exit 0
     }
 
