@@ -775,11 +775,11 @@ function Get-AllRoleScheduleInstances {
 function Format-RemainingTime {
     param([TimeSpan]$Span, [bool]$IsFuture)
     $totalMinutes = [int]$Span.TotalMinutes
-    if ($totalMinutes -lt 1) { return if ($IsFuture) { "in <1m" } else { "<1m" } }
+    if ($totalMinutes -lt 1) { return ($IsFuture ? "in <1m" : "<1m") }
     $h = [int][Math]::Floor($Span.TotalHours)
     $m = $Span.Minutes
     $formatted = if ($h -gt 0) { "${h}h ${m}m" } else { "${m}m" }
-    return if ($IsFuture) { "in $formatted" } else { $formatted }
+    return ($IsFuture ? "in $formatted" : $formatted)
 }
 
 function Show-PimelimStatus {
