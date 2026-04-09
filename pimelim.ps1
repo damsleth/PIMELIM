@@ -982,7 +982,12 @@ function Invoke-Pimelim {
             $candidateEndUtc = $startUtc.AddHours($resolvedDurationHours)
             $key = Format-GraphDateTime -DateValue $startUtc
 
-            if (Test-IntervalOverlap -CandidateStartUtc $startUtc -CandidateEndUtc $candidateEndUtc -ExistingIntervals $existingIntervals) {
+            # When the role is inactive and Now=true, the first window is an immediate activation.
+            # Zombie requests from a prior failed run must not silently block it - bypass the local
+            # overlap check and let Graph be the final arbiter for this one window.
+            $isImmediateActivation = (-not $activeEndUtc) -and $resolvedNow -and ($startUtc -eq $desiredStartsUtc[0])
+
+            if (-not $isImmediateActivation -and (Test-IntervalOverlap -CandidateStartUtc $startUtc -CandidateEndUtc $candidateEndUtc -ExistingIntervals $existingIntervals)) {
                 Write-Log -Message "Skipped overlap for role '$($role.Name)' at $key."
                 continue
             }
