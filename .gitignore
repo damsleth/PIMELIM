@@ -4,3 +4,4 @@
 *.log
 .token-cache.json
 .tmp
+.claude/
