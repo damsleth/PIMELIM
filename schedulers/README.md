@@ -24,7 +24,7 @@ File:
 - `launchd/com.pimelim.runner.plist`
 
 Setup (per-user):
-1. Edit `ProgramArguments`, `WorkingDirectory`, and log file paths in plist
+1. Edit `ProgramArguments` and `WorkingDirectory` in the plist (logs default to `/tmp/pimelim.out.log` and `/tmp/pimelim.err.log`)
 2. Copy plist to `~/Library/LaunchAgents/`
 3. Load and start:
    - `launchctl unload ~/Library/LaunchAgents/com.pimelim.runner.plist 2>/dev/null || true`

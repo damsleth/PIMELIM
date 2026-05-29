@@ -23,9 +23,9 @@
   <true/>
 
   <key>StandardOutPath</key>
-  <string>/Users/CHANGE_ME/Code/PIMELIM/launchd.out.log</string>
+  <string>/tmp/pimelim.out.log</string>
 
   <key>StandardErrorPath</key>
-  <string>/Users/CHANGE_ME/Code/PIMELIM/launchd.err.log</string>
+  <string>/tmp/pimelim.err.log</string>
 </dict>
 </plist>
