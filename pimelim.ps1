@@ -13,12 +13,14 @@ param(
     [switch]$Bootstrap,
     [switch]$DryRun,
     [switch]$Status,
+    [Alias("v")][switch]$Version,
     [Alias("h")][switch]$Help
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $script:LogFilePath = $null
+$script:PimelimVersion = "1.0.0"
 
 # Workaround: .NET may try IPv6 first for Microsoft endpoints; on networks with
 # split-DNS or broken IPv6 routes this causes DNS resolution and connection hangs.
@@ -28,7 +30,7 @@ $env:DOTNET_SYSTEM_NET_DISABLEIPV6 = "1"
 
 function Show-PimelimHelp {
     @"
-# PIMELIM CLI Help
+# PIMELIM v$($script:PimelimVersion) CLI Help
 
 ## Purpose
 Automate Azure Entra PIM self-activation requests for configured eligible roles.
@@ -95,6 +97,9 @@ ACTIVATION_TIME_BUFFER <int> (env only)
 -Status
   Print a table of currently active and scheduled PIM role activations.
   Requires an existing token cache (run -Bootstrap first if needed).
+
+-Version
+  Prints the PIMELIM version (semver). See CHANGELOG.md for release history.
 
 -Help
   Prints this guide.
@@ -1026,7 +1031,7 @@ function Invoke-Pimelim {
         $allowInteractive = $true
     }
 
-    Write-Log -Message "PIMELIM started. Roles=$($resolvedRoles.Count), Now=$resolvedNow, CoverForHours=$resolvedCoverForHours, DurationHours=$resolvedDurationHours, BufferSeconds=$resolvedBufferSeconds, DryRun=$DryRun"
+    Write-Log -Message "PIMELIM v$($script:PimelimVersion) started. Roles=$($resolvedRoles.Count), Now=$resolvedNow, CoverForHours=$resolvedCoverForHours, DurationHours=$resolvedDurationHours, BufferSeconds=$resolvedBufferSeconds, DryRun=$DryRun"
     $accessToken = Get-AccessToken -TenantId $resolvedTenantId -ClientId $resolvedClientId -TokenCachePath $tokenCachePath -AllowInteractive:$allowInteractive
 
     $me = Invoke-GraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/me?`$select=id,userPrincipalName" -AccessToken $accessToken
@@ -1103,6 +1108,11 @@ function Invoke-Pimelim {
 try {
     $scriptDir = Split-Path -Parent $PSCommandPath
     $envPath = Resolve-PathSafe -BaseDirectory $scriptDir -PathValue $EnvFile
+
+    if ($Version) {
+        Write-Host "PIMELIM v$($script:PimelimVersion)"
+        exit 0
+    }
 
     if ($Help) {
         Show-PimelimHelp

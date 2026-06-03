@@ -26,12 +26,13 @@ PIMELIM automatically keeps future Azure Entra PIM role activations scheduled fo
 ## Parameter contract
 - Supported CLI parameters:
 	- `-Setup`
+	- `-EnvFile`
 	- `-TenantId`, `-ClientId`
 	- `-Now`
 	- `-Roles` (hashtable array and JSON string forms)
 	- `-CoverForHours`
 	- `-RoleDurationHours`
-	- `-Bootstrap`, `-DryRun`, `-Help`
+	- `-Bootstrap`, `-DryRun`, `-Status`, `-Version`, `-Help`
 - Precedence: CLI parameters override `.env` values.
 - Role reason fallback: if role reason is missing, default reason to role name.
 - If no params are provided and `.env` is missing, print `-Help` and exit.
@@ -47,6 +48,11 @@ PIMELIM automatically keeps future Azure Entra PIM role activations scheduled fo
 - Preserve idempotency (avoid duplicate schedule requests)
 - Log clearly to console and configured log file
 - Validate with syntax/dry-run before broad changes
+
+## Versioning and releases
+- Semantic Versioning (`MAJOR.MINOR.PATCH`); the single source of truth is `$script:PimelimVersion` in `pimelim.ps1`
+- On every release: bump `$script:PimelimVersion`, add a `CHANGELOG.md` entry, tag `v<version>`, and create a GitHub release
+- `CHANGELOG.md` follows Keep a Changelog (Added/Changed/Fixed/Removed sections)
 
 ## Change policy
 - Prefer focused patches over large rewrites

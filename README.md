@@ -183,9 +183,12 @@ See `.env.example` for full template. Key settings:
 - `-Bootstrap`
 - `-DryRun`
 - `-Status`
+- `-Version`
 - `-Help`
 
 `-Status` prints a console table of currently active and upcoming scheduled PIM role activations, including start/end times and remaining duration per window.
+
+`-Version` prints the PIMELIM version. Releases follow [Semantic Versioning](https://semver.org); see [CHANGELOG.md](CHANGELOG.md) for release history.
 
 `-Help` prints a structured guide intended for both human and AI-agent readability.
 
