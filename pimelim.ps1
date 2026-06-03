@@ -20,7 +20,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $script:LogFilePath = $null
-$script:PimelimVersion = "1.0.0"
+$script:PimelimVersion = "1.1.0"
 
 # Workaround: .NET may try IPv6 first for Microsoft endpoints; on networks with
 # split-DNS or broken IPv6 routes this causes DNS resolution and connection hangs.
