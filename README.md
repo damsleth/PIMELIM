@@ -28,8 +28,9 @@ It is built for your exact flow:
 	- active role: starts from current active end-time
 	- inactive role + `Now=true`: schedules starting immediately
 	- inactive role + `Now=false`: schedules future-only starting at now + duration
-- Number of windows is calculated as `ceil(CoverForHours / RoleDurationHours)`
-- Overlapping windows are skipped. If Graph still returns an overlap on create, it is logged and treated as skipped.
+- Existing pending activation requests are fetched first; new windows are planned only into the uncovered gaps, so requests that PIM would reject as overlapping are never submitted
+- PIM compares pending request windows at minute granularity (inclusive), so planned windows keep both the configured `ACTIVATION_TIME_BUFFER` and a full minute boundary clear of existing pending windows; a window is clipped shorter when needed to clear an upcoming pending window
+- If Graph still returns an overlap on create (e.g. a zombie pending request from a prior failed run), it is logged and treated as skipped
 - Logs to console + local log file
 
 ## Prerequisites

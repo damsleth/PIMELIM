@@ -105,18 +105,25 @@ Default behavior:
 
 ## Scheduling Behavior
 Per role:
-- If role is currently active: schedule from active end-time.
-- If role is inactive and Now=true: schedule from now.
-- If role is inactive and Now=false: schedule from now + duration (future-only).
+- If role is currently active: coverage is anchored at the active end-time.
+- If role is inactive and Now=true: coverage is anchored at now (immediate activation).
+- If role is inactive and Now=false: coverage is anchored at now + duration (future-only).
 
 Coverage model:
-- Windows are back-to-back with length RoleDurationHours.
-- Number of windows = ceil(CoverForHours / RoleDurationHours).
+- Existing pending activation requests are fetched first; new windows are planned
+  only into the uncovered gaps between them, up to CoverForHours from the anchor.
+- Windows are RoleDurationHours long, except when a window is clipped shorter to
+  clear an upcoming pending request window.
 - CoverForHours=0 schedules no windows.
 
 Overlap safety:
-- Candidate windows that overlap existing non-failed requests are skipped.
-- If Graph reports overlap during create, the window is logged as skipped and execution continues.
+- PIM rejects a new timebound request whose boundary lands in the same wall-clock
+  minute as an existing pending request boundary (minute granularity, inclusive).
+  Planned windows therefore keep at least ACTIVATION_TIME_BUFFER seconds AND a
+  full minute boundary clear of existing pending windows, so doomed requests are
+  never submitted.
+- If Graph still reports overlap during create (e.g. a zombie pending request from
+  a prior failed run), the window is logged as skipped and execution continues.
 
 ## Requirements
 - PowerShell 7+
@@ -597,17 +604,103 @@ function Truncate-ToUtcSecond {
     return [datetime]::new($DateValue.Year, $DateValue.Month, $DateValue.Day, $DateValue.Hour, $DateValue.Minute, $DateValue.Second, [DateTimeKind]::Utc)
 }
 
-function Get-DesiredStartTimesFromAnchorUtc {
-    param([datetime]$FirstStartUtc, [int]$DurationHours, [int]$WindowCount, [int]$BufferSeconds = 0)
-    $starts = @()
-    for ($i = 0; $i -lt $WindowCount; $i++) { $starts += $FirstStartUtc.AddHours($i * $DurationHours).AddSeconds($i * $BufferSeconds) }
-    return $starts
+function Truncate-ToUtcMinute {
+    param([datetime]$DateValue)
+    return [datetime]::new($DateValue.Year, $DateValue.Month, $DateValue.Day, $DateValue.Hour, $DateValue.Minute, 0, [DateTimeKind]::Utc)
 }
 
-function Get-WindowCountForCoverage {
-    param([int]$CoverForHours, [int]$DurationHours)
-    if ($CoverForHours -le 0) { return 0 }
-    return [int][Math]::Ceiling($CoverForHours / [double]$DurationHours)
+# PIM compares pending request windows at minute granularity with inclusive bounds:
+# a new timebound request whose start or end lands in the same wall-clock minute as
+# an existing pending request's boundary is rejected with
+# OverlapsPendingRoleAssignmentRequests, even with a real gap of up to 59 seconds.
+# (Observed empirically: 33s/46s/2s gaps in the same minute rejected; a 60s gap
+# crossing a minute boundary accepted.) The helpers below produce boundaries that
+# respect both the configured buffer and that minute rule.
+function Get-MinuteSafeStartAfter {
+    param([datetime]$EndUtc, [int]$BufferSeconds)
+    $buffered = $EndUtc.AddSeconds($BufferSeconds)
+    $minuteSafe = (Truncate-ToUtcMinute -DateValue $EndUtc).AddMinutes(1)
+    if ($buffered -gt $minuteSafe) { return $buffered }
+    return $minuteSafe
+}
+
+function Get-MinuteSafeEndBefore {
+    param([datetime]$StartUtc, [int]$BufferSeconds)
+    $buffered = $StartUtc.AddSeconds(-$BufferSeconds)
+    $minuteSafe = (Truncate-ToUtcMinute -DateValue $StartUtc).AddSeconds(-1)
+    if ($buffered -lt $minuteSafe) { return $buffered }
+    return $minuteSafe
+}
+
+function Get-PlannedActivationWindows {
+    param(
+        [Parameter(Mandatory = $true)][datetime]$AnchorUtc,
+        [Parameter(Mandatory = $true)][int]$CoverForHours,
+        [Parameter(Mandatory = $true)][int]$DurationHours,
+        [Parameter(Mandatory = $true)][int]$BufferSeconds,
+        [object[]]$ExistingIntervals = @(),
+        [int]$MinimumWindowMinutes = 5
+    )
+
+    if ($CoverForHours -le 0) { return @() }
+
+    $horizonUtc = $AnchorUtc.AddHours($CoverForHours)
+
+    # Merge existing pending intervals into an ordered, non-overlapping block list.
+    $blocks = @()
+    foreach ($interval in ($ExistingIntervals | Sort-Object -Property StartUtc)) {
+        if ($blocks.Count -gt 0 -and $interval.StartUtc -le $blocks[-1].EndUtc) {
+            if ($interval.EndUtc -gt $blocks[-1].EndUtc) { $blocks[-1].EndUtc = $interval.EndUtc }
+        }
+        else {
+            $blocks += [PSCustomObject]@{ StartUtc = $interval.StartUtc; EndUtc = $interval.EndUtc }
+        }
+    }
+
+    $windows = @()
+    $cursorUtc = $AnchorUtc
+    $blockIndex = 0
+
+    while ($cursorUtc -lt $horizonUtc) {
+        # Skip blocks already behind the cursor, lifting the cursor if it sits
+        # too close (same minute / inside buffer) to a block's end boundary.
+        while ($blockIndex -lt $blocks.Count -and $blocks[$blockIndex].EndUtc -le $cursorUtc) {
+            $safeStart = Get-MinuteSafeStartAfter -EndUtc $blocks[$blockIndex].EndUtc -BufferSeconds $BufferSeconds
+            if ($safeStart -gt $cursorUtc) { $cursorUtc = $safeStart }
+            $blockIndex++
+        }
+
+        # Cursor inside a pending window: that span is already covered, resume after it.
+        if ($blockIndex -lt $blocks.Count -and $blocks[$blockIndex].StartUtc -le $cursorUtc) {
+            $cursorUtc = Get-MinuteSafeStartAfter -EndUtc $blocks[$blockIndex].EndUtc -BufferSeconds $BufferSeconds
+            $blockIndex++
+            continue
+        }
+
+        # Free slot: bounded by the next pending window (minute-safe), if any.
+        $slotEndLimitUtc = $null
+        if ($blockIndex -lt $blocks.Count) {
+            $slotEndLimitUtc = Get-MinuteSafeEndBefore -StartUtc $blocks[$blockIndex].StartUtc -BufferSeconds $BufferSeconds
+        }
+
+        $windowEndUtc = $cursorUtc.AddHours($DurationHours)
+        if ($null -ne $slotEndLimitUtc -and $windowEndUtc -gt $slotEndLimitUtc) { $windowEndUtc = $slotEndLimitUtc }
+
+        if (($windowEndUtc - $cursorUtc).TotalMinutes -ge $MinimumWindowMinutes) {
+            $windows += [PSCustomObject]@{ StartUtc = $cursorUtc; EndUtc = $windowEndUtc }
+            $cursorUtc = Get-MinuteSafeStartAfter -EndUtc $windowEndUtc -BufferSeconds $BufferSeconds
+        }
+        elseif ($blockIndex -lt $blocks.Count) {
+            # Gap too small for a meaningful window: resume after the next pending window.
+            $cursorUtc = Get-MinuteSafeStartAfter -EndUtc $blocks[$blockIndex].EndUtc -BufferSeconds $BufferSeconds
+            $blockIndex++
+        }
+        else {
+            break
+        }
+    }
+
+    return $windows
 }
 
 function Format-GraphDateTime {
@@ -680,14 +773,6 @@ function Get-ExistingScheduledIntervals {
     return $intervals
 }
 
-function Test-IntervalOverlap {
-    param([datetime]$CandidateStartUtc, [datetime]$CandidateEndUtc, [object[]]$ExistingIntervals)
-    foreach ($interval in $ExistingIntervals) {
-        if ($CandidateStartUtc -lt $interval.EndUtc -and $CandidateEndUtc -gt $interval.StartUtc) { return $true }
-    }
-    return $false
-}
-
 function Get-ActiveRoleAssignmentEndUtc {
     param([string]$PrincipalId, [string]$RoleDefinitionId, [string]$AccessToken, [datetime]$NowUtc)
 
@@ -715,8 +800,9 @@ function Get-ActiveRoleAssignmentEndUtc {
 }
 
 function New-ActivationRequest {
-    param([string]$PrincipalId, [string]$RoleDefinitionId, [datetime]$StartUtc, [int]$DurationHours, [string]$Reason, [string]$AccessToken, [switch]$IsDryRun)
+    param([string]$PrincipalId, [string]$RoleDefinitionId, [datetime]$StartUtc, [int]$DurationMinutes, [string]$Reason, [string]$AccessToken, [switch]$IsDryRun)
 
+    $durationIso = if ($DurationMinutes % 60 -eq 0) { "PT$([int]($DurationMinutes / 60))H" } else { "PT${DurationMinutes}M" }
     $body = @{
         action = "selfActivate"
         principalId = $PrincipalId
@@ -726,12 +812,12 @@ function New-ActivationRequest {
         ticketInfo = @{ ticketNumber = "PIMELIM"; ticketSystem = "PIMELIM" }
         scheduleInfo = @{
             startDateTime = (Format-GraphDateTime -DateValue $StartUtc)
-            expiration = @{ type = "afterDuration"; duration = "PT${DurationHours}H" }
+            expiration = @{ type = "afterDuration"; duration = $durationIso }
         }
     }
 
     if ($IsDryRun) {
-        Write-Log -Message "[DryRun] Would create selfActivate request for start $(Format-GraphDateTime -DateValue $StartUtc)."
+        Write-Log -Message "[DryRun] Would create selfActivate request for start $(Format-GraphDateTime -DateValue $StartUtc) (duration $durationIso)."
         return
     }
 
@@ -742,7 +828,9 @@ function New-ActivationRequest {
 function Test-IsOverlapRequestError {
     param([string]$ErrorMessage)
     if ([string]::IsNullOrWhiteSpace($ErrorMessage)) { return $false }
-    return $ErrorMessage -match "OverlapsPendingRoleAssignmentRequests|overlaps existing role assignment requests"
+    # PendingRoleAssignmentRequest (without the Overlaps prefix) is returned when an
+    # immediate activation is blocked by a zombie pending request from a failed run.
+    return $ErrorMessage -match "PendingRoleAssignmentRequest|overlaps existing role assignment requests"
 }
 
 function Get-TenantDisplayName {
@@ -948,60 +1036,56 @@ function Invoke-Pimelim {
     foreach ($role in $resolvedRoles) {
         Write-Log -Message "Processing role '$($role.Name)'"
 
-        $roleNowUtc = (Get-Date).ToUniversalTime()
+        $roleNowUtc = Truncate-ToUtcSecond -DateValue (Get-Date).ToUniversalTime()
         $roleDef = Get-RoleDefinitionByName -RoleName $role.Name -AccessToken $accessToken
         $activeEndUtc = Get-ActiveRoleAssignmentEndUtc -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken -NowUtc $roleNowUtc
 
-        $desiredStartsUtc = @()
         if ($activeEndUtc) {
-            $windowCount = Get-WindowCountForCoverage -CoverForHours $resolvedCoverForHours -DurationHours $resolvedDurationHours
-            $desiredStartsUtc = @(Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $activeEndUtc -DurationHours $resolvedDurationHours -WindowCount $windowCount -BufferSeconds $resolvedBufferSeconds)
-            Write-Log -Message "Role '$($role.Name)' is active until $(Format-GraphDateTime -DateValue $activeEndUtc). Coverage target=$resolvedCoverForHours hour(s), windows=$windowCount."
+            $anchorUtc = $activeEndUtc
+            Write-Log -Message "Role '$($role.Name)' is active until $(Format-GraphDateTime -DateValue $activeEndUtc). Coverage target=$resolvedCoverForHours hour(s)."
         }
         else {
-            $anchor = if ($resolvedNow) { $roleNowUtc } else { $roleNowUtc.AddHours($resolvedDurationHours) }
-            $windowCount = Get-WindowCountForCoverage -CoverForHours $resolvedCoverForHours -DurationHours $resolvedDurationHours
-            if ($windowCount -gt 0) {
-                $desiredStartsUtc = @(Get-DesiredStartTimesFromAnchorUtc -FirstStartUtc $anchor -DurationHours $resolvedDurationHours -WindowCount $windowCount -BufferSeconds $resolvedBufferSeconds)
-                Write-Log -Message "Role '$($role.Name)' is inactive. Scheduling $windowCount window(s) from $(Format-GraphDateTime -DateValue $anchor) to cover $resolvedCoverForHours hour(s)."
-            }
-            else {
-                Write-Log -Message "Role '$($role.Name)' is inactive. No activation requested (CoverForHours=0)."
-            }
+            $anchorUtc = if ($resolvedNow) { $roleNowUtc } else { $roleNowUtc.AddHours($resolvedDurationHours) }
+            Write-Log -Message "Role '$($role.Name)' is inactive. Coverage target=$resolvedCoverForHours hour(s) from $(Format-GraphDateTime -DateValue $anchorUtc)."
         }
 
-        if (@($desiredStartsUtc).Count -eq 0) {
-            Write-Log -Message "Role '$($role.Name)' completed. Created=0"
+        if ($resolvedCoverForHours -le 0) {
+            Write-Log -Message "Role '$($role.Name)' completed. Created=0 (CoverForHours=0)."
             continue
         }
 
+        # Plan new windows only into uncovered gaps between existing pending requests,
+        # keeping every boundary buffer- and minute-safe so Graph never rejects the
+        # request as overlapping. Past-started zombie requests are deliberately absent
+        # from the intervals (see Get-ExistingScheduledIntervals); if one blocks an
+        # immediate activation, Graph is the final arbiter and the create is warn-skipped.
         $existingIntervals = @(Get-ExistingScheduledIntervals -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken)
+        $plannedWindows = @(Get-PlannedActivationWindows -AnchorUtc $anchorUtc -CoverForHours $resolvedCoverForHours -DurationHours $resolvedDurationHours -BufferSeconds $resolvedBufferSeconds -ExistingIntervals $existingIntervals)
+
+        if ($plannedWindows.Count -eq 0) {
+            Write-Log -Message "Role '$($role.Name)' coverage horizon already filled by $($existingIntervals.Count) pending window(s). Created=0"
+            continue
+        }
 
         $created = 0
-        foreach ($startUtc in $desiredStartsUtc) {
-            $candidateEndUtc = $startUtc.AddHours($resolvedDurationHours)
-            $key = Format-GraphDateTime -DateValue $startUtc
-
-            # When the role is inactive and Now=true, the first window is an immediate activation.
-            # Zombie requests from a prior failed run must not silently block it - bypass the local
-            # overlap check and let Graph be the final arbiter for this one window.
-            $isImmediateActivation = (-not $activeEndUtc) -and $resolvedNow -and ($startUtc -eq $desiredStartsUtc[0])
-
-            if (-not $isImmediateActivation -and (Test-IntervalOverlap -CandidateStartUtc $startUtc -CandidateEndUtc $candidateEndUtc -ExistingIntervals $existingIntervals)) {
-                Write-Log -Message "Skipped overlap for role '$($role.Name)' at $key."
-                continue
-            }
+        $fullWindowMinutes = $resolvedDurationHours * 60
+        foreach ($window in $plannedWindows) {
+            $durationMinutes = [int][Math]::Floor(($window.EndUtc - $window.StartUtc).TotalMinutes)
+            $key = Format-GraphDateTime -DateValue $window.StartUtc
 
             try {
-                New-ActivationRequest -PrincipalId $principalId -RoleDefinitionId $roleDef.id -StartUtc $startUtc -DurationHours $resolvedDurationHours -Reason $role.Reason -AccessToken $accessToken -IsDryRun:$DryRun
+                New-ActivationRequest -PrincipalId $principalId -RoleDefinitionId $roleDef.id -StartUtc $window.StartUtc -DurationMinutes $durationMinutes -Reason $role.Reason -AccessToken $accessToken -IsDryRun:$DryRun
                 $created++
-                $existingIntervals += [PSCustomObject]@{ StartUtc = $startUtc; EndUtc = $candidateEndUtc }
-                Write-Log -Message "Scheduled activation at $key for role '$($role.Name)'."
+                if ($durationMinutes -lt $fullWindowMinutes) {
+                    Write-Log -Message "Scheduled activation at $key for role '$($role.Name)' (clipped to $durationMinutes minute(s) to clear a pending window)."
+                }
+                else {
+                    Write-Log -Message "Scheduled activation at $key for role '$($role.Name)'."
+                }
             }
             catch {
                 $errMessage = $_.Exception.Message
                 if (Test-IsOverlapRequestError -ErrorMessage $errMessage) {
-                    $existingIntervals += [PSCustomObject]@{ StartUtc = $startUtc; EndUtc = $candidateEndUtc }
                     Write-Log -Level "WARN" -Message "Skipped overlap for role '$($role.Name)' at $key (reported by Graph on create)."
                     continue
                 }
