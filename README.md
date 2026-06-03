@@ -30,7 +30,8 @@ It is built for your exact flow:
 	- inactive role + `Now=false`: schedules future-only starting at now + duration
 - Existing pending activation requests are fetched first; new windows are planned only into the uncovered gaps, so requests that PIM would reject as overlapping are never submitted
 - PIM compares pending request windows at minute granularity (inclusive), so planned windows keep both the configured `ACTIVATION_TIME_BUFFER` and a full minute boundary clear of existing pending windows; a window is clipped shorter when needed to clear an upcoming pending window
-- If Graph still returns an overlap on create (e.g. a zombie pending request from a prior failed run), it is logged and treated as skipped
+- Free gaps shorter than `MINIMUM_WINDOW_MINUTES` (default 5) are left unscheduled; if that delays an immediate activation, the bounded wait is logged as a warning
+- A stuck pending request from a failed run (start time passed without provisioning) that blocks an immediate activation is canceled via Graph and the activation retried once
 - Logs to console + local log file
 
 ## Prerequisites
@@ -169,7 +170,8 @@ See `.env.example` for full template. Key settings:
 	- `NOW` (default `true`)
 	- `COVER_FOR_HOURS` (default `36`)
 	- `ACTIVATION_DURATION_HOURS` (default `8`)
-	- `ACTIVATION_TIME_BUFFER` (default `60`) — seconds added between consecutive scheduled windows to prevent Graph overlap errors
+	- `ACTIVATION_TIME_BUFFER` (default `60`) — seconds added between consecutive scheduled windows to prevent Graph overlap errors; values below 60 are effectively raised to the next whole-minute boundary
+	- `MINIMUM_WINDOW_MINUTES` (default `5`) — smallest activation window worth scheduling; clamped to ≥ 5, PIM's minimum activation duration
 	- `LOG_FILE` (default `./pimelim.log`)
 
 ## CLI Parameters

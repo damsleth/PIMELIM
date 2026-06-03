@@ -21,6 +21,8 @@ PIMELIM automatically keeps future Azure Entra PIM role activations scheduled fo
 	- `NOW` (default `true`)
 	- `COVER_FOR_HOURS` (default `36`)
 	- `ACTIVATION_DURATION_HOURS` (default `8`)
+	- `ACTIVATION_TIME_BUFFER` (default `60`)
+	- `MINIMUM_WINDOW_MINUTES` (default `5`, clamped to >= 5)
 	- `LOG_FILE` (default `./pimelim.log`)
 
 ## Parameter contract

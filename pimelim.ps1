@@ -84,8 +84,16 @@ Automate Azure Entra PIM self-activation requests for configured eligible roles.
 
 ACTIVATION_TIME_BUFFER <int> (env only)
   Seconds added between consecutive scheduled windows to avoid Graph overlap errors.
+  Values below 60 are effectively raised to the next whole-minute boundary, because
+  PIM compares pending request windows at minute granularity.
   Default: 60
   Fallback: ACTIVATION_TIME_BUFFER in .env
+
+MINIMUM_WINDOW_MINUTES <int> (env only)
+  Smallest activation window worth scheduling; free gaps shorter than this are left
+  unscheduled (logged). Clamped to >= 5, the minimum activation duration PIM accepts.
+  Default: 5
+  Fallback: MINIMUM_WINDOW_MINUTES in .env
 
 -Bootstrap
     Forces interactive device-code login if needed.
@@ -119,6 +127,12 @@ Coverage model:
   only into the uncovered gaps between them, up to CoverForHours from the anchor.
 - Windows are RoleDurationHours long, except when a window is clipped shorter to
   clear an upcoming pending request window.
+- Gaps shorter than MINIMUM_WINDOW_MINUTES are left unscheduled. If that delays an
+  immediate activation (Now=true), the wait is bounded by the next pending window
+  and is logged as a warning.
+- Stuck pending requests from failed runs (start time passed without provisioning)
+  that block an immediate activation are canceled via Graph and the activation is
+  retried once.
 - CoverForHours=0 schedules no windows.
 
 Overlap safety:
@@ -691,7 +705,11 @@ function Get-PlannedActivationWindows {
         $windowEndUtc = $cursorUtc.AddHours($DurationHours)
         if ($null -ne $slotEndLimitUtc -and $windowEndUtc -gt $slotEndLimitUtc) { $windowEndUtc = $slotEndLimitUtc }
 
-        if (($windowEndUtc - $cursorUtc).TotalMinutes -ge $MinimumWindowMinutes) {
+        $windowMinutes = [int][Math]::Floor(($windowEndUtc - $cursorUtc).TotalMinutes)
+        if ($windowMinutes -ge $MinimumWindowMinutes) {
+            # Snap the window end to the whole-minute duration that will actually be
+            # requested from Graph, so the plan and the submitted request agree exactly.
+            $windowEndUtc = $cursorUtc.AddMinutes($windowMinutes)
             $windows += [PSCustomObject]@{ StartUtc = $cursorUtc; EndUtc = $windowEndUtc }
             $cursorUtc = Get-MinuteSafeStartAfter -EndUtc $windowEndUtc -BufferSeconds $BufferSeconds
         }
@@ -701,6 +719,9 @@ function Get-PlannedActivationWindows {
             $blockIndex++
         }
         else {
+            # Defensive backstop only: with no block remaining the slot is unbounded, so a
+            # full window (>= 60 min, since DurationHours >= 1) always passes the minimum
+            # gate above. Unreachable unless those invariants change.
             break
         }
     }
@@ -711,6 +732,13 @@ function Get-PlannedActivationWindows {
 function Format-GraphDateTime {
     param([datetime]$DateValue)
     return $DateValue.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+}
+
+function Format-IsoDuration {
+    param([Parameter(Mandatory = $true)][int]$Minutes)
+    # XmlConvert emits canonical ISO 8601 (PT8H, PT7H29M), keeping the write path
+    # symmetric with the XmlConvert::ToTimeSpan parse in Try-GetEndTimeFromScheduleInfo.
+    return [System.Xml.XmlConvert]::ToString([TimeSpan]::FromMinutes($Minutes))
 }
 
 function Get-RoleDefinitionByName {
@@ -807,7 +835,7 @@ function Get-ActiveRoleAssignmentEndUtc {
 function New-ActivationRequest {
     param([string]$PrincipalId, [string]$RoleDefinitionId, [datetime]$StartUtc, [int]$DurationMinutes, [string]$Reason, [string]$AccessToken, [switch]$IsDryRun)
 
-    $durationIso = if ($DurationMinutes % 60 -eq 0) { "PT$([int]($DurationMinutes / 60))H" } else { "PT${DurationMinutes}M" }
+    $durationIso = Format-IsoDuration -Minutes $DurationMinutes
     $body = @{
         action = "selfActivate"
         principalId = $PrincipalId
@@ -836,6 +864,42 @@ function Test-IsOverlapRequestError {
     # PendingRoleAssignmentRequest (without the Overlaps prefix) is returned when an
     # immediate activation is blocked by a zombie pending request from a failed run.
     return $ErrorMessage -match "PendingRoleAssignmentRequest|overlaps existing role assignment requests"
+}
+
+function Clear-StuckPendingRequests {
+    param([string]$PrincipalId, [string]$RoleDefinitionId, [string]$AccessToken, [datetime]$NowUtc)
+
+    # A "zombie" is a selfActivate request whose scheduled start has passed without
+    # provisioning and that still sits in a pending state. PIM keeps counting it as
+    # pending, so it blocks new immediate activations until canceled or expired.
+    # Future-starting pending requests are healthy schedule windows - never cancel those.
+    $filter = "principalId eq '$PrincipalId' and roleDefinitionId eq '$RoleDefinitionId'"
+    $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests?`$filter=$([uri]::EscapeDataString($filter))"
+    $canceled = 0
+
+    while ($uri) {
+        $response = Invoke-GraphRequest -Method GET -Uri $uri -AccessToken $AccessToken
+        foreach ($item in $response.value) {
+            if ([string]$item.action -ne 'selfActivate') { continue }
+            if ([string]$item.status -notmatch '^(Granted|PendingApproval|PendingAdminDecision|PendingProvisioning|PendingScheduleCreation)$') { continue }
+            if (-not $item.scheduleInfo -or -not $item.scheduleInfo.startDateTime) { continue }
+
+            $startUtc = Convert-ToUtcDateTime -Value $item.scheduleInfo.startDateTime
+            if ($startUtc -gt $NowUtc) { continue }
+
+            try {
+                $null = Invoke-GraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests/$($item.id)/cancel" -AccessToken $AccessToken
+                $canceled++
+                Write-Log -Level "WARN" -Message "Canceled stuck pending request $($item.id) (start $($item.scheduleInfo.startDateTime), status $($item.status))."
+            }
+            catch {
+                Write-Log -Level "WARN" -Message "Could not cancel stuck pending request $($item.id): $($_.Exception.Message)"
+            }
+        }
+        $uri = Get-GraphNextLink -Response $response
+    }
+
+    return $canceled
 }
 
 function Get-TenantDisplayName {
@@ -1004,6 +1068,9 @@ function Invoke-Pimelim {
 
     $resolvedBufferSeconds = Convert-ToIntOrDefault -Value (Get-ConfigValue -EnvMap $envMap -Key "ACTIVATION_TIME_BUFFER") -Default 60
 
+    # PIM rejects activations shorter than 5 minutes, so clamp the floor there.
+    $resolvedMinimumWindowMinutes = [Math]::Max(5, (Convert-ToIntOrDefault -Value (Get-ConfigValue -EnvMap $envMap -Key "MINIMUM_WINDOW_MINUTES") -Default 5))
+
     if ($resolvedCoverForHours -lt 0 -or $resolvedDurationHours -le 0) {
         throw "CoverForHours must be >= 0 and RoleDurationHours must be > 0."
     }
@@ -1031,8 +1098,14 @@ function Invoke-Pimelim {
         $allowInteractive = $true
     }
 
-    Write-Log -Message "PIMELIM v$($script:PimelimVersion) started. Roles=$($resolvedRoles.Count), Now=$resolvedNow, CoverForHours=$resolvedCoverForHours, DurationHours=$resolvedDurationHours, BufferSeconds=$resolvedBufferSeconds, DryRun=$DryRun"
+    Write-Log -Message "PIMELIM v$($script:PimelimVersion) started. Roles=$($resolvedRoles.Count), Now=$resolvedNow, CoverForHours=$resolvedCoverForHours, DurationHours=$resolvedDurationHours, BufferSeconds=$resolvedBufferSeconds, MinWindowMinutes=$resolvedMinimumWindowMinutes, DryRun=$DryRun"
     $accessToken = Get-AccessToken -TenantId $resolvedTenantId -ClientId $resolvedClientId -TokenCachePath $tokenCachePath -AllowInteractive:$allowInteractive
+
+    # Token acquired above so -Bootstrap still works with CoverForHours=0.
+    if ($resolvedCoverForHours -eq 0) {
+        Write-Log -Message "CoverForHours=0; nothing to schedule."
+        return
+    }
 
     $me = Invoke-GraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/me?`$select=id,userPrincipalName" -AccessToken $accessToken
     $principalId = $me.id
@@ -1054,21 +1127,30 @@ function Invoke-Pimelim {
             Write-Log -Message "Role '$($role.Name)' is inactive. Coverage target=$resolvedCoverForHours hour(s) from $(Format-GraphDateTime -DateValue $anchorUtc)."
         }
 
-        if ($resolvedCoverForHours -le 0) {
-            Write-Log -Message "Role '$($role.Name)' completed. Created=0 (CoverForHours=0)."
-            continue
-        }
-
         # Plan new windows only into uncovered gaps between existing pending requests,
         # keeping every boundary buffer- and minute-safe so Graph never rejects the
         # request as overlapping. Past-started zombie requests are deliberately absent
         # from the intervals (see Get-ExistingScheduledIntervals); if one blocks an
-        # immediate activation, Graph is the final arbiter and the create is warn-skipped.
+        # immediate activation, it is canceled via Graph and the activation retried.
         $existingIntervals = @(Get-ExistingScheduledIntervals -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken)
-        $plannedWindows = @(Get-PlannedActivationWindows -AnchorUtc $anchorUtc -CoverForHours $resolvedCoverForHours -DurationHours $resolvedDurationHours -BufferSeconds $resolvedBufferSeconds -ExistingIntervals $existingIntervals)
+        $plannedWindows = @(Get-PlannedActivationWindows -AnchorUtc $anchorUtc -CoverForHours $resolvedCoverForHours -DurationHours $resolvedDurationHours -BufferSeconds $resolvedBufferSeconds -ExistingIntervals $existingIntervals -MinimumWindowMinutes $resolvedMinimumWindowMinutes)
+
+        # Visibility: an immediate activation was requested but the gap before the next
+        # pending window is below the minimum, so the role stays inactive until coverage
+        # resumes. The wait is bounded by that pending window's start.
+        if ((-not $activeEndUtc) -and $resolvedNow) {
+            $firstPlannedStart = if ($plannedWindows.Count -gt 0) { $plannedWindows[0].StartUtc } else { $null }
+            if ($null -eq $firstPlannedStart -or $firstPlannedStart -gt $anchorUtc) {
+                $resumeUtc = @($existingIntervals | ForEach-Object { $_.StartUtc }) + @($firstPlannedStart) |
+                    Where-Object { $null -ne $_ -and $_ -gt $anchorUtc } | Sort-Object | Select-Object -First 1
+                if ($resumeUtc) {
+                    Write-Log -Level "WARN" -Message "Role '$($role.Name)' stays inactive until $(Format-GraphDateTime -DateValue $resumeUtc); the free gap before the next pending window is shorter than the $resolvedMinimumWindowMinutes-minute minimum."
+                }
+            }
+        }
 
         if ($plannedWindows.Count -eq 0) {
-            Write-Log -Message "Role '$($role.Name)' coverage horizon already filled by $($existingIntervals.Count) pending window(s). Created=0"
+            Write-Log -Message "Role '$($role.Name)' completed. Created=0 (no schedulable gap of at least $resolvedMinimumWindowMinutes minute(s) within the $resolvedCoverForHours-hour horizon; $($existingIntervals.Count) pending window(s) found)."
             continue
         }
 
@@ -1082,7 +1164,7 @@ function Invoke-Pimelim {
                 New-ActivationRequest -PrincipalId $principalId -RoleDefinitionId $roleDef.id -StartUtc $window.StartUtc -DurationMinutes $durationMinutes -Reason $role.Reason -AccessToken $accessToken -IsDryRun:$DryRun
                 $created++
                 if ($durationMinutes -lt $fullWindowMinutes) {
-                    Write-Log -Message "Scheduled activation at $key for role '$($role.Name)' (clipped to $durationMinutes minute(s) to clear a pending window)."
+                    Write-Log -Message "Scheduled activation at $key for role '$($role.Name)' (clipped to $(Format-IsoDuration -Minutes $durationMinutes) to clear a pending window)."
                 }
                 else {
                     Write-Log -Message "Scheduled activation at $key for role '$($role.Name)'."
@@ -1091,6 +1173,26 @@ function Invoke-Pimelim {
             catch {
                 $errMessage = $_.Exception.Message
                 if (Test-IsOverlapRequestError -ErrorMessage $errMessage) {
+                    # An immediate activation blocked by a stuck (past-started, never
+                    # provisioned) pending request: cancel the zombie and retry once,
+                    # instead of leaving it to block every future run too.
+                    $isImmediateWindow = (-not $activeEndUtc) -and $resolvedNow -and ($window.StartUtc -eq $anchorUtc)
+                    if ($isImmediateWindow -and -not $DryRun) {
+                        $canceledCount = Clear-StuckPendingRequests -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken -NowUtc $roleNowUtc
+                        if ($canceledCount -gt 0) {
+                            try {
+                                New-ActivationRequest -PrincipalId $principalId -RoleDefinitionId $roleDef.id -StartUtc $window.StartUtc -DurationMinutes $durationMinutes -Reason $role.Reason -AccessToken $accessToken
+                                $created++
+                                Write-Log -Message "Scheduled activation at $key for role '$($role.Name)' (after canceling $canceledCount stuck pending request(s))."
+                                continue
+                            }
+                            catch {
+                                Write-Log -Level "WARN" -Message "Retry after canceling stuck request(s) failed for role '$($role.Name)' at ${key}: $($_.Exception.Message)"
+                                continue
+                            }
+                        }
+                    }
+
                     Write-Log -Level "WARN" -Message "Skipped overlap for role '$($role.Name)' at $key (reported by Graph on create)."
                     continue
                 }
