@@ -31,7 +31,7 @@ It is built for your exact flow:
 - Existing pending activation requests are fetched first; new windows are planned only into the uncovered gaps, so requests that PIM would reject as overlapping are never submitted
 - PIM compares pending request windows at minute granularity (inclusive), so planned windows keep both the configured `ACTIVATION_TIME_BUFFER` and a full minute boundary clear of existing pending windows; a window is clipped shorter when needed to clear an upcoming pending window
 - Free gaps shorter than `MINIMUM_WINDOW_MINUTES` (default 5) are left unscheduled; if that delays an immediate activation, the bounded wait is logged as a warning
-- A stuck pending request from a failed run (start time passed without provisioning) that blocks an immediate activation is canceled via Graph and the activation retried once
+- A stuck, cancelable request from a failed run (`Granted`, start time passed without provisioning) that blocks an immediate activation is canceled via Graph and the activation retried once; other pending states are not canceled because Graph does not allow it
 - Logs to console + local log file
 
 ## Prerequisites
@@ -188,7 +188,7 @@ See `.env.example` for full template. Key settings:
 - `-Version`
 - `-Help`
 
-`-Status` prints a console table of currently active and upcoming scheduled PIM role activations, including start/end times and remaining duration per window.
+`-Status` prints a console table of currently active and upcoming scheduled PIM role activations, including start/end times and remaining duration per window. Active windows come from Graph schedule instances; future windows come from nonterminal self-activation requests, so they are visible before Graph creates their instances.
 
 `-Version` prints the PIMELIM version. Releases follow [Semantic Versioning](https://semver.org); see [CHANGELOG.md](CHANGELOG.md) for release history.
 

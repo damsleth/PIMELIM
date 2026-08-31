@@ -5,6 +5,18 @@ All notable changes to PIMELIM are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-08-31
+
+### Fixed
+
+- `-Status` now includes future nonterminal self-activation requests, which exist
+  before Graph exposes their schedule instances, and deduplicates windows visible
+  through both APIs during provisioning transitions.
+- The planner now clips its final activation window to the coverage horizon instead
+  of allowing it to extend by up to almost one role duration past that horizon.
+- Stuck-request cleanup now calls Graph's cancel action only for `Granted`
+  requests, the only request status for which that action is supported.
+
 ## [1.1.0] - 2026-06-03
 
 Hardening release from a full code review of 1.0.0.
@@ -100,5 +112,6 @@ history for details):
   block new scheduling; Graph remains the final arbiter for immediate
   activations.
 
+[1.1.1]: https://github.com/damsleth/PIMELIM/releases/tag/v1.1.1
 [1.1.0]: https://github.com/damsleth/PIMELIM/releases/tag/v1.1.0
 [1.0.0]: https://github.com/damsleth/PIMELIM/releases/tag/v1.0.0

@@ -20,7 +20,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $script:LogFilePath = $null
-$script:PimelimVersion = "1.1.0"
+$script:PimelimVersion = "1.1.1"
 
 # Workaround: .NET may try IPv6 first for Microsoft endpoints; on networks with
 # split-DNS or broken IPv6 routes this causes DNS resolution and connection hangs.
@@ -104,6 +104,8 @@ MINIMUM_WINDOW_MINUTES <int> (env only)
 
 -Status
   Print a table of currently active and scheduled PIM role activations.
+  Active windows are read from schedule instances; future windows are read from
+  nonterminal self-activation requests, before their instances exist.
   Requires an existing token cache (run -Bootstrap first if needed).
 
 -Version
@@ -130,9 +132,9 @@ Coverage model:
 - Gaps shorter than MINIMUM_WINDOW_MINUTES are left unscheduled. If that delays an
   immediate activation (Now=true), the wait is bounded by the next pending window
   and is logged as a warning.
-- Stuck pending requests from failed runs (start time passed without provisioning)
-  that block an immediate activation are canceled via Graph and the activation is
-  retried once.
+- Stuck, cancelable requests from failed runs (status Granted, start time passed
+  without provisioning) that block an immediate activation are canceled via Graph
+  and the activation is retried once.
 - CoverForHours=0 schedules no windows.
 
 Overlap safety:
@@ -703,6 +705,7 @@ function Get-PlannedActivationWindows {
         }
 
         $windowEndUtc = $cursorUtc.AddHours($DurationHours)
+        if ($windowEndUtc -gt $horizonUtc) { $windowEndUtc = $horizonUtc }
         if ($null -ne $slotEndLimitUtc -and $windowEndUtc -gt $slotEndLimitUtc) { $windowEndUtc = $slotEndLimitUtc }
 
         $windowMinutes = [int][Math]::Floor(($windowEndUtc - $cursorUtc).TotalMinutes)
@@ -719,9 +722,8 @@ function Get-PlannedActivationWindows {
             $blockIndex++
         }
         else {
-            # Defensive backstop only: with no block remaining the slot is unbounded, so a
-            # full window (>= 60 min, since DurationHours >= 1) always passes the minimum
-            # gate above. Unreachable unless those invariants change.
+            # The only remaining free slot is the tail of the coverage horizon and is
+            # shorter than the configured minimum window.
             break
         }
     }
@@ -774,9 +776,13 @@ function Try-GetEndTimeFromScheduleInfo {
 }
 
 function Get-ExistingScheduledIntervals {
-    param([string]$PrincipalId, [string]$RoleDefinitionId, [string]$AccessToken)
+    param(
+        [string]$PrincipalId,
+        [string]$RoleDefinitionId,
+        [string]$AccessToken,
+        [datetime]$NowUtc = (Get-Date).ToUniversalTime()
+    )
 
-    $nowUtc = (Get-Date).ToUniversalTime()
     $filter = "principalId eq '$PrincipalId' and roleDefinitionId eq '$RoleDefinitionId'"
     $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests?`$filter=$([uri]::EscapeDataString($filter))"
     $intervals = @()
@@ -794,16 +800,20 @@ function Get-ExistingScheduledIntervals {
                 # Only include future-starting requests. Past-started windows are authoritative via
                 # the instances API (Get-ActiveRoleAssignmentEndUtc). A past-started request with no
                 # corresponding instance is a failed/stuck activation and must not block new scheduling.
-                if ($startUtc -le $nowUtc) { continue }
+                if ($startUtc -le $NowUtc) { continue }
                 $endUtc = Try-GetEndTimeFromScheduleInfo -ScheduleInfo $item.scheduleInfo -StartUtc $startUtc
                 if ($endUtc -and $endUtc -gt $startUtc) {
-                    $intervals += [PSCustomObject]@{ StartUtc = $startUtc; EndUtc = (Truncate-ToUtcSecond -DateValue $endUtc) }
+                    $intervals += [PSCustomObject]@{
+                        StartUtc = $startUtc
+                        EndUtc = (Truncate-ToUtcSecond -DateValue $endUtc)
+                        RequestStatus = $status
+                    }
                 }
             }
         }
         $uri = Get-GraphNextLink -Response $response
     }
-    return $intervals
+    return $intervals | Sort-Object StartUtc
 }
 
 function Get-ActiveRoleAssignmentEndUtc {
@@ -881,7 +891,9 @@ function Clear-StuckPendingRequests {
         $response = Invoke-GraphRequest -Method GET -Uri $uri -AccessToken $AccessToken
         foreach ($item in $response.value) {
             if ([string]$item.action -ne 'selfActivate') { continue }
-            if ([string]$item.status -notmatch '^(Granted|PendingApproval|PendingAdminDecision|PendingProvisioning|PendingScheduleCreation)$') { continue }
+            # Graph's cancel action only accepts requests in Granted status. Other
+            # pending states may block scheduling but cannot be cleared by this API.
+            if ([string]$item.status -ne 'Granted') { continue }
             if (-not $item.scheduleInfo -or -not $item.scheduleInfo.startDateTime) { continue }
 
             $startUtc = Convert-ToUtcDateTime -Value $item.scheduleInfo.startDateTime
@@ -912,9 +924,13 @@ function Get-TenantDisplayName {
 }
 
 function Get-AllRoleScheduleInstances {
-    param([string]$PrincipalId, [string]$RoleDefinitionId, [string]$AccessToken)
+    param(
+        [string]$PrincipalId,
+        [string]$RoleDefinitionId,
+        [string]$AccessToken,
+        [datetime]$NowUtc = (Get-Date).ToUniversalTime()
+    )
 
-    $nowUtc = (Get-Date).ToUniversalTime()
     $filter = "principalId eq '$PrincipalId' and roleDefinitionId eq '$RoleDefinitionId'"
     $uri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleInstances?`$filter=$([uri]::EscapeDataString($filter))"
     $instances = @()
@@ -925,7 +941,7 @@ function Get-AllRoleScheduleInstances {
             if (-not $item.startDateTime -or -not $item.endDateTime) { continue }
             $startUtc = Convert-ToUtcDateTime -Value $item.startDateTime
             $endUtc = Convert-ToUtcDateTime -Value $item.endDateTime
-            if ($endUtc -le $nowUtc) { continue }
+            if ($endUtc -le $NowUtc) { continue }
             $instances += [PSCustomObject]@{ StartUtc = $startUtc; EndUtc = $endUtc }
         }
         $uri = Get-GraphNextLink -Response $response
@@ -988,16 +1004,35 @@ function Show-PimelimStatus {
             continue
         }
 
-        $instances = @(Get-AllRoleScheduleInstances -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken)
+        $instances = @(Get-AllRoleScheduleInstances -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken -NowUtc $nowUtc)
+        $scheduledIntervals = @(Get-ExistingScheduledIntervals -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken -NowUtc $nowUtc)
+        $roleRows = @()
+        $seenIntervals = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
 
-        if ($instances.Count -eq 0) {
+        foreach ($inst in $instances) {
+            $startUtc = Truncate-ToUtcSecond -DateValue $inst.StartUtc
+            $endUtc = Truncate-ToUtcSecond -DateValue $inst.EndUtc
+            $key = "$(Format-GraphDateTime -DateValue $startUtc)|$(Format-GraphDateTime -DateValue $endUtc)"
+            $null = $seenIntervals.Add($key)
+            $status = if ($startUtc -le $nowUtc) { "ACTIVE" } else { "SCHEDULED" }
+            $roleRows += [PSCustomObject]@{ Role = $role.Name; Status = $status; StartUtc = $startUtc; EndUtc = $endUtc }
+        }
+
+        # Future self-activation requests exist before Graph exposes corresponding
+        # schedule instances. Include them, but suppress a row when both APIs expose
+        # the same interval during a provisioning transition.
+        foreach ($interval in $scheduledIntervals) {
+            $key = "$(Format-GraphDateTime -DateValue $interval.StartUtc)|$(Format-GraphDateTime -DateValue $interval.EndUtc)"
+            if ($seenIntervals.Add($key)) {
+                $roleRows += [PSCustomObject]@{ Role = $role.Name; Status = "SCHEDULED"; StartUtc = $interval.StartUtc; EndUtc = $interval.EndUtc }
+            }
+        }
+
+        if ($roleRows.Count -eq 0) {
             $rows += [PSCustomObject]@{ Role = $role.Name; Status = "INACTIVE"; StartUtc = $null; EndUtc = $null }
         }
         else {
-            foreach ($inst in $instances) {
-                $status = if ($inst.StartUtc -le $nowUtc) { "ACTIVE" } else { "SCHEDULED" }
-                $rows += [PSCustomObject]@{ Role = $role.Name; Status = $status; StartUtc = $inst.StartUtc; EndUtc = $inst.EndUtc }
-            }
+            $rows += @($roleRows | Sort-Object StartUtc)
         }
     }
 
@@ -1132,7 +1167,7 @@ function Invoke-Pimelim {
         # request as overlapping. Past-started zombie requests are deliberately absent
         # from the intervals (see Get-ExistingScheduledIntervals); if one blocks an
         # immediate activation, it is canceled via Graph and the activation retried.
-        $existingIntervals = @(Get-ExistingScheduledIntervals -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken)
+        $existingIntervals = @(Get-ExistingScheduledIntervals -PrincipalId $principalId -RoleDefinitionId $roleDef.id -AccessToken $accessToken -NowUtc $roleNowUtc)
         $plannedWindows = @(Get-PlannedActivationWindows -AnchorUtc $anchorUtc -CoverForHours $resolvedCoverForHours -DurationHours $resolvedDurationHours -BufferSeconds $resolvedBufferSeconds -ExistingIntervals $existingIntervals -MinimumWindowMinutes $resolvedMinimumWindowMinutes)
 
         # Visibility: an immediate activation was requested but the gap before the next
